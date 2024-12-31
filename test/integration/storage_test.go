@@ -122,7 +122,16 @@ func TestStorageIntegration(t *testing.T) {
 			assert.Equal(t, item.Content.Type, retrieved.Content.Type)
 			assert.Equal(t, item.Content.Data, retrieved.Content.Data)
 			assert.Equal(t, item.Vector, retrieved.Vector)
-			assert.Equal(t, item.Metadata["test"], retrieved.Metadata["test"])
+			// Handle float64 conversion in metadata comparison
+			if expectedInt, ok := item.Metadata["test"].(int); ok {
+				if actualFloat, ok := retrieved.Metadata["test"].(float64); ok {
+					assert.Equal(t, float64(expectedInt), actualFloat)
+				} else {
+					assert.Equal(t, item.Metadata["test"], retrieved.Metadata["test"])
+				}
+			} else {
+				assert.Equal(t, item.Metadata["test"], retrieved.Metadata["test"])
+			}
 		}
 		totalRetrievalTime := time.Since(retrievalStart)
 		t.Logf("Total retrieval took %v", totalRetrievalTime)
