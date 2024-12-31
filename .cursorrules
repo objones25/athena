@@ -1,0 +1,15 @@
+{
+  "check_for_updates": true,
+  "ignore_patterns": [
+    "*.log",
+    "tmp/*",
+    "dist/*",
+    "coverage.out"
+  ],
+  "format_on_save": true,
+  "go": {
+    "format_tool": "gofmt",
+    "imports_on_save": true,
+    "test_on_save": false
+  }
+}

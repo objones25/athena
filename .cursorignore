@@ -1,0 +1,6 @@
+bin/
+vendor/
+dist/
+tmp/
+coverage.out
+.env
