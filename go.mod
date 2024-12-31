@@ -4,6 +4,7 @@ go 1.23.3
 
 require (
 	github.com/go-redis/redis/v8 v8.11.5
+	github.com/hashicorp/golang-lru v1.0.2
 	github.com/milvus-io/milvus-sdk-go/v2 v2.4.2
 	github.com/prometheus/client_golang v1.20.5
 	github.com/rs/zerolog v1.33.0
