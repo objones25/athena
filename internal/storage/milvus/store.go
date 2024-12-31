@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/milvus-io/milvus-sdk-go/v2/client"
 	"github.com/milvus-io/milvus-sdk-go/v2/entity"
 	"github.com/objones25/athena/internal/storage"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 // Config holds the configuration for the Milvus store
@@ -30,7 +33,9 @@ const (
 	defaultDimension = 128
 	defaultTimeout   = 30 * time.Second
 	batchSize        = 1000
-	maxConnections   = 10
+	maxConnections   = 5
+	maxPoolSize      = 20
+	connTimeout      = 10 * time.Second
 )
 
 var (
@@ -93,19 +98,14 @@ func (wq *WorkQueue) Close() {
 
 // MilvusStore implements the storage.Store interface using Milvus as the backend.
 type MilvusStore struct {
-	collection string
-	dimension  int
-	timeout    time.Duration
-	host       string
-	port       int
-	maxRetries int
-	pool       *ConnectionPool
-	workQueue  *WorkQueue
-	metrics    struct {
-		failedOps  int64
-		lastError  time.Time
-		reconnects int64
-	}
+	client         client.Client
+	collectionName string
+	dimension      int
+	batchSize      int
+	maxRetries     int
+	poolSize       int
+	pool           *connectionPool
+	logger         zerolog.Logger
 }
 
 // ConnectionPool manages a pool of Milvus connections
@@ -144,24 +144,37 @@ func NewMilvusStore(cfg Config) (*MilvusStore, error) {
 		cfg.MaxRetries = 3
 	}
 
-	store := &MilvusStore{
-		collection: cfg.CollectionName,
-		dimension:  cfg.Dimension,
-		timeout:    defaultTimeout,
-		host:       cfg.Host,
-		port:       cfg.Port,
-		maxRetries: cfg.MaxRetries,
-		workQueue:  newWorkQueue(runtime.NumCPU(), cfg.PoolSize*100),
+	// Create Milvus client
+	ctx := context.Background()
+	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	c, err := client.NewClient(ctx, client.Config{
+		Address: addr,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Milvus client: %w", err)
 	}
 
 	// Initialize connection pool
-	if err := store.initializePool(cfg.PoolSize); err != nil {
-		return nil, fmt.Errorf("failed to initialize connection pool: %w", err)
+	pool, err := newConnectionPool(c, cfg.PoolSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create connection pool: %w", err)
 	}
 
-	// Initialize collection with retry logic
-	if err := store.withRetry(context.Background(), store.ensureCollection); err != nil {
-		return nil, fmt.Errorf("failed to ensure collection: %w", err)
+	// Create store instance
+	store := &MilvusStore{
+		client:         c,
+		collectionName: cfg.CollectionName,
+		dimension:      cfg.Dimension,
+		batchSize:      cfg.BatchSize,
+		maxRetries:     cfg.MaxRetries,
+		poolSize:       cfg.PoolSize,
+		pool:           pool,
+		logger:         log.With().Str("component", "milvus").Logger(),
+	}
+
+	// Initialize collection
+	if err := store.initCollection(ctx); err != nil {
+		return nil, fmt.Errorf("failed to initialize collection: %w", err)
 	}
 
 	return store, nil
@@ -250,32 +263,58 @@ func (s *MilvusStore) manageConnections() {
 
 func (s *MilvusStore) scalePool(up bool) {
 	if up {
-		// Increase pool size by 25% up to a maximum
+		// Increase pool size by 25% up to the maximum
 		newSize := int(float64(s.pool.maxSize) * 1.25)
-		if newSize > 100 {
+		if newSize > maxPoolSize {
 			return
 		}
 
+		// Create new connections
 		for i := s.pool.maxSize; i < newSize; i++ {
 			if conn, err := s.createConnection(); err == nil {
-				pc := &pooledConnection{
-					client:   conn,
-					lastUsed: time.Now(),
+					pc := &pooledConnection{
+						client:   conn,
+						lastUsed: time.Now(),
+					}
+					ctx, cancel := context.WithCancel(context.Background())
+					pc.healthCtx = cancel
+					go s.connectionHealthCheck(ctx, pc)
+					
+					// Try to add to pool with timeout
+					select {
+					case s.pool.connections <- pc:
+						// Successfully added
+					case <-time.After(time.Second):
+						// Pool is full, close the connection
+						pc.healthCtx()
+						pc.client.Close()
+						return
+					}
 				}
-				ctx, cancel := context.WithCancel(context.Background())
-				pc.healthCtx = cancel
-				go s.connectionHealthCheck(ctx, pc)
-				s.pool.connections <- pc
 			}
 		}
 		s.pool.maxSize = newSize
 	} else {
 		// Decrease pool size by 25% down to a minimum
 		newSize := int(float64(s.pool.maxSize) * 0.75)
-		if newSize < 5 {
+		if newSize < maxConnections {
 			return
 		}
 		s.pool.maxSize = newSize
+		
+		// Close excess connections
+		for i := 0; i < (s.pool.maxSize-newSize); i++ {
+			select {
+			case pc := <-s.pool.connections:
+				if pc.healthCtx != nil {
+					pc.healthCtx()
+				}
+				pc.client.Close()
+			default:
+				// No more connections to close
+				return
+			}
+		}
 	}
 }
 
@@ -518,26 +557,103 @@ func (s *MilvusStore) Insert(ctx context.Context, items []*storage.Item) error {
 		return nil
 	}
 
-	totalItems := len(items)
-	fmt.Printf("[Milvus:Insert] Starting insertion of %d items\n", totalItems)
 	start := time.Now()
+	logger := s.logger.With().Str("operation", "Insert").Int("item_count", len(items)).Logger()
+	logger.Debug().Msg("Starting insertion of items")
 
-	var err error
-	if totalItems <= 10 {
-		// Use work queue for small batches
-		err = s.processBatchWithQueue(ctx, items)
-	} else {
-		// Use existing large batch processing
-		err = s.withRetry(ctx, func(ctx context.Context) error {
-			return s.processLargeBatch(ctx, items)
-		})
+	// Pre-allocate slices for better performance
+	itemCount := len(items)
+	ids := make([]string, itemCount)
+	vectors := make([][]float32, itemCount)
+	contentTypes := make([]string, itemCount)
+	contentData := make([]string, itemCount)
+	metadata := make([]string, itemCount)
+	createdAt := make([]int64, itemCount)
+	expiresAt := make([]int64, itemCount)
+
+	// Process items in parallel for large batches
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.NumCPU()) // Limit concurrency to number of CPUs
+	var processingErr error
+	var errMu sync.Mutex
+
+	for i, item := range items {
+		if processingErr != nil {
+			break
+		}
+
+		wg.Add(1)
+		go func(idx int, item *storage.Item) {
+			defer wg.Done()
+			sem <- struct{}{}        // Acquire semaphore
+			defer func() { <-sem }() // Release semaphore
+
+			// Process item data
+			ids[idx] = item.ID
+			vectors[idx] = item.Vector
+			contentTypes[idx] = string(item.Content.Type)
+			contentData[idx] = string(item.Content.Data)
+
+			// Marshal metadata
+			metadataBytes, err := json.Marshal(item.Metadata)
+			if err != nil {
+				errMu.Lock()
+				processingErr = fmt.Errorf("failed to marshal metadata for item %s: %w", item.ID, err)
+				errMu.Unlock()
+				return
+			}
+			metadata[idx] = string(metadataBytes)
+
+			// Convert timestamps
+			createdAt[idx] = item.CreatedAt.UnixNano()
+			expiresAt[idx] = item.ExpiresAt.UnixNano()
+		}(i, item)
 	}
 
+	wg.Wait()
+
+	if processingErr != nil {
+		return processingErr
+	}
+
+	// Get connection from pool
+	conn, err := s.getConnection()
 	if err != nil {
-		return fmt.Errorf("insertion failed: %w", err)
+		return fmt.Errorf("failed to get connection: %w", err)
+	}
+	defer s.releaseConnection(conn)
+
+	// Create columns
+	columns := []entity.Column{
+		entity.NewColumnVarChar("id", ids),
+		entity.NewColumnFloatVector("vector", s.dimension, vectors),
+		entity.NewColumnVarChar("content_type", contentTypes),
+		entity.NewColumnVarChar("content_data", contentData),
+		entity.NewColumnVarChar("metadata", metadata),
+		entity.NewColumnInt64("created_at", createdAt),
+		entity.NewColumnInt64("expires_at", expiresAt),
 	}
 
-	fmt.Printf("[Milvus:Insert] Successfully inserted all %d items in %v\n", totalItems, time.Since(start))
+	// Insert data
+	insertStart := time.Now()
+	_, err = conn.Insert(ctx, s.collection, "", columns...)
+	if err != nil {
+		return fmt.Errorf("failed to insert data: %w", err)
+	}
+
+	// Flush data
+	flushStart := time.Now()
+	err = conn.Flush(ctx, s.collection, false)
+	if err != nil {
+		return fmt.Errorf("failed to flush data: %w", err)
+	}
+
+	logger.Debug().
+		Dur("total_duration", time.Since(start)).
+		Dur("insert_duration", time.Since(insertStart)).
+		Dur("flush_duration", time.Since(flushStart)).
+		Msg("Successfully inserted items")
+
 	return nil
 }
 
@@ -576,6 +692,8 @@ func (s *MilvusStore) GetByID(ctx context.Context, id string) (*storage.Item, er
 	outputFields := []string{"id", "vector", "content_type", "content_data", "metadata", "created_at", "expires_at"}
 
 	queryStart := time.Now()
+	fmt.Printf("[Milvus:GetByID] Executing query with expression: %s\n", expr)
+
 	// Execute query with timeout
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -602,39 +720,74 @@ func (s *MilvusStore) GetByID(ctx context.Context, id string) (*storage.Item, er
 
 	// Process the first result
 	processStart := time.Now()
-	item := &storage.Item{}
+	fmt.Printf("[Milvus:GetByID] Processing result columns: %d\n", len(result))
+
+	item := &storage.Item{
+		Content:  storage.Content{},
+		Metadata: make(map[string]interface{}),
+	}
 	foundData := false
 
 	for _, col := range result {
+		fmt.Printf("[Milvus:GetByID] Processing column %s (type: %T)\n", col.Name(), col)
+
 		switch col.Name() {
 		case "id":
 			if idCol, ok := col.(*entity.ColumnVarChar); ok && len(idCol.Data()) > 0 {
 				item.ID = idCol.Data()[0]
 				foundData = true
+				fmt.Printf("[Milvus:GetByID] Successfully extracted ID: %s\n", item.ID)
+			} else {
+				fmt.Printf("[Milvus:GetByID] Failed to extract ID, type: %T, has data: %v\n",
+					col, ok && len(idCol.Data()) > 0)
 			}
 		case "vector":
 			if vecCol, ok := col.(*entity.ColumnFloatVector); ok && len(vecCol.Data()) > 0 {
 				item.Vector = vecCol.Data()[0]
+				fmt.Printf("[Milvus:GetByID] Successfully extracted vector of length %d\n",
+					len(item.Vector))
+			} else {
+				fmt.Printf("[Milvus:GetByID] Failed to extract vector, type: %T\n", col)
 			}
 		case "content_type":
 			if typeCol, ok := col.(*entity.ColumnVarChar); ok && len(typeCol.Data()) > 0 {
 				item.Content.Type = storage.ContentType(typeCol.Data()[0])
+				fmt.Printf("[Milvus:GetByID] Successfully extracted content type: %s\n",
+					item.Content.Type)
+			} else {
+				fmt.Printf("[Milvus:GetByID] Failed to extract content type, type: %T\n", col)
 			}
 		case "content_data":
 			if dataCol, ok := col.(*entity.ColumnVarChar); ok && len(dataCol.Data()) > 0 {
 				item.Content.Data = []byte(dataCol.Data()[0])
+				fmt.Printf("[Milvus:GetByID] Successfully extracted content data of length %d\n",
+					len(item.Content.Data))
+			} else {
+				fmt.Printf("[Milvus:GetByID] Failed to extract content data, type: %T\n", col)
 			}
 		case "metadata":
 			if metaCol, ok := col.(*entity.ColumnVarChar); ok && len(metaCol.Data()) > 0 {
 				item.Metadata = decodeMetadata(metaCol.Data()[0])
+				fmt.Printf("[Milvus:GetByID] Successfully extracted metadata with %d keys\n",
+					len(item.Metadata))
+			} else {
+				fmt.Printf("[Milvus:GetByID] Failed to extract metadata, type: %T\n", col)
 			}
 		case "created_at":
 			if timeCol, ok := col.(*entity.ColumnInt64); ok && len(timeCol.Data()) > 0 {
 				item.CreatedAt = time.Unix(0, timeCol.Data()[0])
+				fmt.Printf("[Milvus:GetByID] Successfully extracted created_at: %v\n",
+					item.CreatedAt)
+			} else {
+				fmt.Printf("[Milvus:GetByID] Failed to extract created_at, type: %T\n", col)
 			}
 		case "expires_at":
 			if timeCol, ok := col.(*entity.ColumnInt64); ok && len(timeCol.Data()) > 0 {
 				item.ExpiresAt = time.Unix(0, timeCol.Data()[0])
+				fmt.Printf("[Milvus:GetByID] Successfully extracted expires_at: %v\n",
+					item.ExpiresAt)
+			} else {
+				fmt.Printf("[Milvus:GetByID] Failed to extract expires_at, type: %T\n", col)
 			}
 		}
 	}
@@ -644,6 +797,7 @@ func (s *MilvusStore) GetByID(ctx context.Context, id string) (*storage.Item, er
 
 	// If no actual data was found, return nil
 	if !foundData || item.ID == "" {
+		fmt.Printf("[Milvus:GetByID] No valid data found for ID: %s\n", id)
 		return nil, nil
 	}
 
@@ -881,7 +1035,7 @@ func (s *MilvusStore) ensureCollection(ctx context.Context) error {
 // Search performs a similarity search using the provided vector
 func (s *MilvusStore) Search(ctx context.Context, vector []float32, limit int) ([]*storage.Item, error) {
 	start := time.Now()
-	fmt.Printf("[Milvus:Search] Starting search with vector of dimension %d, limit %d\n", len(vector), limit)
+	fmt.Printf("[Milvus:Search] Starting search with vector dimension %d, limit %d\n", len(vector), limit)
 
 	if len(vector) != s.dimension {
 		return nil, fmt.Errorf("invalid vector dimension: got %d, want %d", len(vector), s.dimension)
@@ -963,50 +1117,73 @@ func (s *MilvusStore) Search(ctx context.Context, vector []float32, limit int) (
 			}
 			var convErr error
 
-			// Extract fields from columns with safe type conversion
+			// Extract fields from columns with safe type conversion and debug logging
 			for _, col := range result.Fields {
+				fmt.Printf("[Milvus:Search] Processing column %s (type: %T) for result %d\n",
+					col.Name(), col, i)
+
 				switch col.Name() {
 				case "id":
 					if idCol, ok := col.(*entity.ColumnVarChar); ok && len(idCol.Data()) > i {
 						item.ID = idCol.Data()[i]
+						fmt.Printf("[Milvus:Search] Successfully extracted ID: %s\n", item.ID)
 					} else {
 						convErr = fmt.Errorf("invalid id column type or index: %T", col)
+						fmt.Printf("[Milvus:Search] Error extracting ID: %v\n", convErr)
 					}
 				case "vector":
 					if vecCol, ok := col.(*entity.ColumnFloatVector); ok && len(vecCol.Data()) > i {
 						item.Vector = vecCol.Data()[i]
+						fmt.Printf("[Milvus:Search] Successfully extracted vector of length %d\n",
+							len(item.Vector))
 					} else {
 						convErr = fmt.Errorf("invalid vector column type or index: %T", col)
+						fmt.Printf("[Milvus:Search] Error extracting vector: %v\n", convErr)
 					}
 				case "content_type":
 					if typeCol, ok := col.(*entity.ColumnVarChar); ok && len(typeCol.Data()) > i {
 						item.Content.Type = storage.ContentType(typeCol.Data()[i])
+						fmt.Printf("[Milvus:Search] Successfully extracted content type: %s\n",
+							item.Content.Type)
 					} else {
 						convErr = fmt.Errorf("invalid content_type column type or index: %T", col)
+						fmt.Printf("[Milvus:Search] Error extracting content type: %v\n", convErr)
 					}
 				case "content_data":
 					if dataCol, ok := col.(*entity.ColumnVarChar); ok && len(dataCol.Data()) > i {
 						item.Content.Data = []byte(dataCol.Data()[i])
+						fmt.Printf("[Milvus:Search] Successfully extracted content data of length %d\n",
+							len(item.Content.Data))
 					} else {
 						convErr = fmt.Errorf("invalid content_data column type or index: %T", col)
+						fmt.Printf("[Milvus:Search] Error extracting content data: %v\n", convErr)
 					}
 				case "metadata":
 					if metaCol, ok := col.(*entity.ColumnVarChar); ok && len(metaCol.Data()) > i {
 						item.Metadata = decodeMetadata(metaCol.Data()[i])
+						fmt.Printf("[Milvus:Search] Successfully extracted metadata with %d keys\n",
+							len(item.Metadata))
 					} else {
 						convErr = fmt.Errorf("invalid metadata column type or index: %T", col)
+						fmt.Printf("[Milvus:Search] Error extracting metadata: %v\n", convErr)
 					}
 				case "created_at":
 					if timeCol, ok := col.(*entity.ColumnInt64); ok && len(timeCol.Data()) > i {
 						item.CreatedAt = time.Unix(0, timeCol.Data()[i])
+						fmt.Printf("[Milvus:Search] Successfully extracted created_at: %v\n",
+							item.CreatedAt)
 					} else {
 						convErr = fmt.Errorf("invalid created_at column type or index: %T", col)
+						fmt.Printf("[Milvus:Search] Error extracting created_at: %v\n", convErr)
 					}
 				case "expires_at":
 					if timeCol, ok := col.(*entity.ColumnInt64); ok && len(timeCol.Data()) > i {
 						item.ExpiresAt = time.Unix(0, timeCol.Data()[i])
+						fmt.Printf("[Milvus:Search] Successfully extracted expires_at: %v\n",
+							item.ExpiresAt)
 					} else {
 						convErr = fmt.Errorf("invalid expires_at column type or index: %T", col)
+						fmt.Printf("[Milvus:Search] Error extracting expires_at: %v\n", convErr)
 					}
 				}
 
@@ -1017,6 +1194,8 @@ func (s *MilvusStore) Search(ctx context.Context, vector []float32, limit int) (
 
 			// Validate required fields
 			if item.ID == "" || item.Vector == nil {
+				fmt.Printf("[Milvus:Search] Skipping invalid item (ID empty: %v, Vector nil: %v)\n",
+					item.ID == "", item.Vector == nil)
 				continue // Skip invalid items
 			}
 
@@ -1035,22 +1214,35 @@ func (s *MilvusStore) Close() error {
 	s.workQueue.Close()
 
 	// Close all connections in the pool
-	for i := 0; i < s.pool.maxSize; i++ {
-		select {
-		case pc := <-s.pool.connections:
-			if pc.healthCtx != nil {
-				pc.healthCtx()
+	closeTimeout := time.After(5 * time.Second)
+	closed := make(chan struct{})
+
+	go func() {
+		for i := 0; i < s.pool.maxSize; i++ {
+			select {
+			case pc := <-s.pool.connections:
+				if pc.healthCtx != nil {
+					pc.healthCtx()
+				}
+				if err := pc.client.Close(); err != nil {
+					fmt.Printf("failed to close connection: %v\n", err)
+				}
+			default:
+				// Pool is empty
+				break
 			}
-			if err := pc.client.Close(); err != nil {
-				fmt.Printf("failed to close connection: %v\n", err)
-			}
-		default:
-			// Pool is empty
-			break
 		}
+		close(s.pool.connections)
+		close(closed)
+	}()
+
+	// Wait for cleanup with timeout
+	select {
+	case <-closed:
+		return nil
+	case <-closeTimeout:
+		return fmt.Errorf("timeout while closing connections")
 	}
-	close(s.pool.connections)
-	return nil
 }
 
 // processLargeBatch handles large batch insertions efficiently
