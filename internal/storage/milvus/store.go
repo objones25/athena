@@ -763,15 +763,24 @@ func (s *MilvusStore) GetByID(ctx context.Context, id string) (*storage.Item, er
 
 	// Execute the query
 	s.logger.Debug().Str("expression", expr).Msg("Executing query")
-	queryResult, err := conn.Query(ctx, s.collectionName, []string{}, expr, outputFields)
+	fmt.Printf("[Milvus:Get] Executing query with expression: %s\n", expr)
+	queryResult, err := conn.Query(ctx, s.collection, []string{}, expr, outputFields)
 	if err != nil {
+		fmt.Printf("[Milvus:Get] Query failed: %v\n", err)
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
+	fmt.Printf("[Milvus:Get] Query returned %d columns\n", len(queryResult))
 
 	// Process results
 	item, err := s.processQueryResult(queryResult)
 	if err != nil {
+		fmt.Printf("[Milvus:Get] Failed to process query result: %v\n", err)
 		return nil, fmt.Errorf("failed to process query result: %w", err)
+	}
+	if item == nil {
+		fmt.Printf("[Milvus:Get] No item found for ID: %s\n", id)
+	} else {
+		fmt.Printf("[Milvus:Get] Successfully retrieved item with ID: %s\n", item.ID)
 	}
 
 	// If we found the item, cache it and trigger prefetch
@@ -843,9 +852,11 @@ func (s *MilvusStore) DeleteFromStore(ctx context.Context, ids []string) error {
 	return s.deleteChunk(ctx, ids)
 }
 
+// deleteChunk processes a chunk of IDs for deletion
 func (s *MilvusStore) deleteChunk(ctx context.Context, ids []string) error {
 	chunkStart := time.Now()
 	fmt.Printf("[Milvus:DeleteChunk] Starting deletion of %d items\n", len(ids))
+	fmt.Printf("[Milvus:DeleteChunk] Items to delete: %v\n", ids)
 
 	return s.withRetry(ctx, func(ctx context.Context) error {
 		// Get connection
@@ -864,16 +875,37 @@ func (s *MilvusStore) deleteChunk(ctx context.Context, ids []string) error {
 			idList[i] = fmt.Sprintf("'%s'", id)
 		}
 		expr := fmt.Sprintf("id in [%s]", strings.Join(idList, ","))
-		fmt.Printf("[Milvus:DeleteChunk] Built expression in %v\n", time.Since(exprStart))
+		fmt.Printf("[Milvus:DeleteChunk] Built expression in %v: %s\n", time.Since(exprStart), expr)
 
-		// Delete the records
-		deleteStart := time.Now()
-		if err := conn.Delete(ctx, s.collection, "", expr); err != nil {
-			fmt.Printf("[Milvus:DeleteChunk] Deletion failed after %v: %v\n",
-				time.Since(deleteStart), err)
-			return fmt.Errorf("failed to delete chunk: %w", err)
+		// Verify items exist before deletion
+		verifyStart := time.Now()
+		queryResult, err := conn.Query(ctx, s.collection, []string{}, expr, []string{"id"})
+		if err != nil {
+			fmt.Printf("[Milvus:DeleteChunk] Pre-deletion verification query failed: %v\n", err)
+		} else if len(queryResult) > 0 {
+			if idCol, ok := queryResult[0].(*entity.ColumnVarChar); ok {
+				fmt.Printf("[Milvus:DeleteChunk] Found %d items before deletion: %v\n",
+					len(idCol.Data()), idCol.Data())
+			}
 		}
-		fmt.Printf("[Milvus:DeleteChunk] Deletion executed in %v\n", time.Since(deleteStart))
+		fmt.Printf("[Milvus:DeleteChunk] Pre-deletion verification took %v\n", time.Since(verifyStart))
+
+		// Delete the records with retry
+		deleteStart := time.Now()
+		maxRetries := 3
+		for i := 0; i < maxRetries; i++ {
+			if err := conn.Delete(ctx, s.collection, "", expr); err != nil {
+				fmt.Printf("[Milvus:DeleteChunk] Deletion attempt %d failed after %v: %v\n",
+					i+1, time.Since(deleteStart), err)
+				if i == maxRetries-1 {
+					return fmt.Errorf("failed to delete chunk after %d attempts: %w", maxRetries, err)
+				}
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			fmt.Printf("[Milvus:DeleteChunk] Deletion executed in %v\n", time.Since(deleteStart))
+			break
+		}
 
 		// Flush to ensure deletion is persisted
 		flushStart := time.Now()
@@ -883,6 +915,66 @@ func (s *MilvusStore) deleteChunk(ctx context.Context, ids []string) error {
 			return fmt.Errorf("failed to flush after deletion: %w", err)
 		}
 		fmt.Printf("[Milvus:DeleteChunk] Flush completed in %v\n", time.Since(flushStart))
+
+		// Load collection to ensure changes are reflected in memory
+		loadStart := time.Now()
+		if err := conn.LoadCollection(ctx, s.collection, false); err != nil {
+			fmt.Printf("[Milvus:DeleteChunk] Load failed after %v: %v\n",
+				time.Since(loadStart), err)
+			return fmt.Errorf("failed to load collection after deletion: %w", err)
+		}
+		fmt.Printf("[Milvus:DeleteChunk] Collection loaded in %v\n", time.Since(loadStart))
+
+		// Wait for collection to be fully loaded with timeout
+		waitStart := time.Now()
+		timeout := time.After(10 * time.Second)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-timeout:
+				return fmt.Errorf("timeout waiting for collection to be loaded")
+			case <-ticker.C:
+				loadState, err := conn.GetLoadState(ctx, s.collection, []string{})
+				if err != nil {
+					fmt.Printf("[Milvus:DeleteChunk] Failed to get load state after %v: %v\n",
+						time.Since(waitStart), err)
+					return fmt.Errorf("failed to get load state: %w", err)
+				}
+				fmt.Printf("[Milvus:DeleteChunk] Current load state: %d\n", loadState)
+				if loadState == entity.LoadStateLoaded {
+					fmt.Printf("[Milvus:DeleteChunk] Collection fully loaded in %v\n", time.Since(waitStart))
+					goto verifyDeletion
+				}
+			}
+		}
+
+	verifyDeletion:
+		// Verify items are deleted with retry
+		verifyStart = time.Now()
+		maxVerifyRetries := 3
+		for i := 0; i < maxVerifyRetries; i++ {
+			queryResult, err = conn.Query(ctx, s.collection, []string{}, expr, []string{"id"})
+			if err != nil {
+				fmt.Printf("[Milvus:DeleteChunk] Post-deletion verification query %d failed: %v\n", i+1, err)
+				continue
+			}
+			if len(queryResult) == 0 || len(queryResult[0].(*entity.ColumnVarChar).Data()) == 0 {
+				fmt.Printf("[Milvus:DeleteChunk] Deletion verified - no items remaining\n")
+				break
+			}
+			if i == maxVerifyRetries-1 {
+				if idCol, ok := queryResult[0].(*entity.ColumnVarChar); ok {
+					remainingIds := idCol.Data()
+					fmt.Printf("[Milvus:DeleteChunk] WARNING: Found %d items still present after deletion: %v\n",
+						len(remainingIds), remainingIds)
+					return fmt.Errorf("deletion verification failed: items still present after %d retries", maxVerifyRetries)
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		fmt.Printf("[Milvus:DeleteChunk] Post-deletion verification took %v\n", time.Since(verifyStart))
 
 		// Remove from cache
 		cacheStart := time.Now()
@@ -1046,6 +1138,18 @@ func (s *MilvusStore) ensureCollection(ctx context.Context) error {
 		err = conn.LoadCollection(ctx, s.collection, false)
 		if err != nil {
 			return fmt.Errorf("failed to load collection: %w", err)
+		}
+
+		// Wait for collection to be loaded
+		for {
+			loadState, err := conn.GetLoadState(ctx, s.collection, []string{})
+			if err != nil {
+				return fmt.Errorf("failed to get load state: %w", err)
+			}
+			if loadState == entity.LoadStateLoaded {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
 		fmt.Printf("[Milvus:Collection] Collection loaded in %v\n", time.Since(loadStart))
 	}
@@ -1720,6 +1824,7 @@ func (s *MilvusStore) BatchSet(ctx context.Context, items []*storage.Item) error
 	expiresAtColumn := make([]int64, len(items))
 
 	// Fill columns
+	fmt.Printf("[Milvus:BatchSet] Preparing data for insertion...\n")
 	for i, item := range items {
 		idColumn[i] = item.ID
 		vectorColumn[i] = item.Vector
@@ -1728,9 +1833,12 @@ func (s *MilvusStore) BatchSet(ctx context.Context, items []*storage.Item) error
 		metadataColumn[i] = encodeMetadata(item.Metadata)
 		createdAtColumn[i] = item.CreatedAt.UnixNano()
 		expiresAtColumn[i] = item.ExpiresAt.UnixNano()
+		fmt.Printf("[Milvus:BatchSet] Prepared item %d: ID=%s, VectorLen=%d, ContentType=%s\n",
+			i, item.ID, len(item.Vector), item.Content.Type)
 	}
 
 	// Get connection from pool
+	fmt.Printf("[Milvus:BatchSet] Getting connection from pool...\n")
 	conn, err := s.getConnection()
 	if err != nil {
 		return fmt.Errorf("failed to get connection for batch insert: %w", err)
@@ -1738,6 +1846,7 @@ func (s *MilvusStore) BatchSet(ctx context.Context, items []*storage.Item) error
 	defer s.releaseConnection(conn)
 
 	// Create insert columns
+	fmt.Printf("[Milvus:BatchSet] Creating insert columns...\n")
 	insertColumns := []entity.Column{
 		entity.NewColumnVarChar("id", idColumn),
 		entity.NewColumnFloatVector("vector", s.dimension, vectorColumn),
@@ -1749,10 +1858,41 @@ func (s *MilvusStore) BatchSet(ctx context.Context, items []*storage.Item) error
 	}
 
 	// Execute insert
-	_, err = conn.Insert(ctx, s.collection, "", insertColumns...)
+	fmt.Printf("[Milvus:BatchSet] Executing insert operation...\n")
+	insertResult, err := conn.Insert(ctx, s.collection, "", insertColumns...)
 	if err != nil {
 		return fmt.Errorf("failed to insert batch: %w", err)
 	}
+	fmt.Printf("[Milvus:BatchSet] Insert operation completed with result: %+v\n", insertResult)
+
+	// Add flush operation to ensure data is persisted
+	fmt.Printf("[Milvus:BatchSet] Flushing data...\n")
+	if err := conn.Flush(ctx, s.collection, false); err != nil {
+		return fmt.Errorf("failed to flush after batch insert: %w", err)
+	}
+	fmt.Printf("[Milvus:BatchSet] Flush completed\n")
+
+	// Load collection to ensure data is available for querying
+	fmt.Printf("[Milvus:BatchSet] Loading collection...\n")
+	if err := conn.LoadCollection(ctx, s.collection, false); err != nil {
+		return fmt.Errorf("failed to load collection after insert: %w", err)
+	}
+	fmt.Printf("[Milvus:BatchSet] Collection loaded\n")
+
+	// Wait for collection to be fully loaded
+	fmt.Printf("[Milvus:BatchSet] Waiting for collection to be fully loaded...\n")
+	for {
+		loadState, err := conn.GetLoadState(ctx, s.collection, []string{})
+		if err != nil {
+			return fmt.Errorf("failed to get load state: %w", err)
+		}
+		fmt.Printf("[Milvus:BatchSet] Current load state: %v\n", loadState)
+		if loadState == entity.LoadStateLoaded {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	fmt.Printf("[Milvus:BatchSet] Collection fully loaded\n")
 
 	fmt.Printf("[Milvus:BatchSet] Batch operation completed in %v\n", time.Since(start))
 	return nil
@@ -1761,7 +1901,14 @@ func (s *MilvusStore) BatchSet(ctx context.Context, items []*storage.Item) error
 // processQueryResult converts Milvus query results into a storage.Item
 func (s *MilvusStore) processQueryResult(result []entity.Column) (*storage.Item, error) {
 	if len(result) == 0 {
+		fmt.Printf("[Milvus:ProcessResult] No columns in result\n")
 		return nil, nil
+	}
+
+	fmt.Printf("[Milvus:ProcessResult] Processing %d columns\n", len(result))
+	for _, col := range result {
+		fmt.Printf("[Milvus:ProcessResult] Column %s has type %T and length %d\n",
+			col.Name(), col, col.Len())
 	}
 
 	item := &storage.Item{
@@ -1773,41 +1920,76 @@ func (s *MilvusStore) processQueryResult(result []entity.Column) (*storage.Item,
 	for _, col := range result {
 		switch col.Name() {
 		case "id":
-			if idCol, ok := col.(*entity.ColumnVarChar); ok && len(idCol.Data()) > 0 {
-				item.ID = idCol.Data()[0]
-				foundData = true
+			if idCol, ok := col.(*entity.ColumnVarChar); ok {
+				data := idCol.Data()
+				fmt.Printf("[Milvus:ProcessResult] ID column has %d values\n", len(data))
+				if len(data) > 0 {
+					item.ID = data[0]
+					foundData = true
+					fmt.Printf("[Milvus:ProcessResult] Found ID: %s\n", item.ID)
+				}
 			}
 		case "vector":
-			if vecCol, ok := col.(*entity.ColumnFloatVector); ok && len(vecCol.Data()) > 0 {
-				item.Vector = vecCol.Data()[0]
+			if vecCol, ok := col.(*entity.ColumnFloatVector); ok {
+				data := vecCol.Data()
+				fmt.Printf("[Milvus:ProcessResult] Vector column has %d values\n", len(data))
+				if len(data) > 0 {
+					item.Vector = data[0]
+					fmt.Printf("[Milvus:ProcessResult] Found vector of length %d\n", len(item.Vector))
+				}
 			}
 		case "content_type":
-			if typeCol, ok := col.(*entity.ColumnVarChar); ok && len(typeCol.Data()) > 0 {
-				item.Content.Type = storage.ContentType(typeCol.Data()[0])
+			if typeCol, ok := col.(*entity.ColumnVarChar); ok {
+				data := typeCol.Data()
+				fmt.Printf("[Milvus:ProcessResult] Content type column has %d values\n", len(data))
+				if len(data) > 0 {
+					item.Content.Type = storage.ContentType(data[0])
+					fmt.Printf("[Milvus:ProcessResult] Found content type: %s\n", item.Content.Type)
+				}
 			}
 		case "content_data":
-			if dataCol, ok := col.(*entity.ColumnVarChar); ok && len(dataCol.Data()) > 0 {
-				item.Content.Data = []byte(dataCol.Data()[0])
+			if dataCol, ok := col.(*entity.ColumnVarChar); ok {
+				data := dataCol.Data()
+				fmt.Printf("[Milvus:ProcessResult] Content data column has %d values\n", len(data))
+				if len(data) > 0 {
+					item.Content.Data = []byte(data[0])
+					fmt.Printf("[Milvus:ProcessResult] Found content data of length %d\n", len(item.Content.Data))
+				}
 			}
 		case "metadata":
-			if metaCol, ok := col.(*entity.ColumnVarChar); ok && len(metaCol.Data()) > 0 {
-				item.Metadata = decodeMetadata(metaCol.Data()[0])
+			if metaCol, ok := col.(*entity.ColumnVarChar); ok {
+				data := metaCol.Data()
+				fmt.Printf("[Milvus:ProcessResult] Metadata column has %d values\n", len(data))
+				if len(data) > 0 {
+					item.Metadata = decodeMetadata(data[0])
+					fmt.Printf("[Milvus:ProcessResult] Found metadata with %d keys\n", len(item.Metadata))
+				}
 			}
 		case "created_at":
-			if timeCol, ok := col.(*entity.ColumnInt64); ok && len(timeCol.Data()) > 0 {
-				item.CreatedAt = time.Unix(0, timeCol.Data()[0])
+			if timeCol, ok := col.(*entity.ColumnInt64); ok {
+				data := timeCol.Data()
+				if len(data) > 0 {
+					item.CreatedAt = time.Unix(0, data[0])
+					fmt.Printf("[Milvus:ProcessResult] Found created_at: %v\n", item.CreatedAt)
+				}
 			}
 		case "expires_at":
-			if timeCol, ok := col.(*entity.ColumnInt64); ok && len(timeCol.Data()) > 0 {
-				item.ExpiresAt = time.Unix(0, timeCol.Data()[0])
+			if timeCol, ok := col.(*entity.ColumnInt64); ok {
+				data := timeCol.Data()
+				if len(data) > 0 {
+					item.ExpiresAt = time.Unix(0, data[0])
+					fmt.Printf("[Milvus:ProcessResult] Found expires_at: %v\n", item.ExpiresAt)
+				}
 			}
 		}
 	}
 
 	if !foundData || item.ID == "" {
+		fmt.Printf("[Milvus:ProcessResult] No valid data found in result\n")
 		return nil, nil
 	}
 
+	fmt.Printf("[Milvus:ProcessResult] Successfully processed item with ID: %s\n", item.ID)
 	return item, nil
 }
 

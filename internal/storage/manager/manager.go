@@ -87,7 +87,7 @@ func (m *Manager) BatchSet(ctx context.Context, items []*storage.Item) error {
 	// Store in vector store first
 	vectorStart := time.Now()
 	fmt.Printf("[BatchSet] Starting vector store insertion\n")
-	if err := m.vectorStore.Insert(ctx, items); err != nil {
+	if err := m.vectorStore.BatchSet(ctx, items); err != nil {
 		fmt.Printf("[BatchSet] Vector store insertion failed after %v: %v\n", time.Since(vectorStart), err)
 		return fmt.Errorf("failed to store in vector store: %w", err)
 	}
@@ -190,7 +190,22 @@ func (m *Manager) Search(ctx context.Context, vector []float32, limit int) ([]*s
 // DeleteFromStore removes items from both stores
 func (m *Manager) DeleteFromStore(ctx context.Context, ids []string) error {
 	start := time.Now()
-	fmt.Printf("[Delete] Starting deletion of %d items\n", len(ids))
+	fmt.Printf("[Delete] Starting deletion of %d items: %v\n", len(ids), ids)
+
+	// Verify items exist before deletion
+	verifyStart := time.Now()
+	fmt.Printf("[Delete] Verifying items before deletion\n")
+	for _, id := range ids {
+		item, err := m.Get(ctx, id)
+		if err != nil {
+			fmt.Printf("[Delete] Error verifying item %s: %v\n", id, err)
+		} else if item != nil {
+			fmt.Printf("[Delete] Found item %s before deletion\n", id)
+		} else {
+			fmt.Printf("[Delete] Item %s not found before deletion\n", id)
+		}
+	}
+	fmt.Printf("[Delete] Pre-deletion verification took %v\n", time.Since(verifyStart))
 
 	// Delete from vector store first
 	vectorStart := time.Now()
@@ -212,6 +227,22 @@ func (m *Manager) DeleteFromStore(ctx context.Context, ids []string) error {
 		}
 	}
 	fmt.Printf("[Delete] Cache deletion completed in %v\n", time.Since(cacheStart))
+
+	// Verify items are deleted
+	verifyStart = time.Now()
+	fmt.Printf("[Delete] Verifying items after deletion\n")
+	for _, id := range ids {
+		item, err := m.Get(ctx, id)
+		if err != nil {
+			fmt.Printf("[Delete] Error verifying deletion of item %s: %v\n", id, err)
+		} else if item != nil {
+			fmt.Printf("[Delete] WARNING: Item %s still exists after deletion: %+v\n", id, item)
+		} else {
+			fmt.Printf("[Delete] Confirmed deletion of item %s\n", id)
+		}
+	}
+	fmt.Printf("[Delete] Post-deletion verification took %v\n", time.Since(verifyStart))
+
 	fmt.Printf("[Delete] Total operation took %v\n", time.Since(start))
 	return nil
 }
