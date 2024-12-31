@@ -9,25 +9,6 @@ import (
 	"github.com/objones25/athena/internal/storage"
 	"github.com/objones25/athena/internal/storage/cache"
 	"github.com/objones25/athena/internal/storage/milvus"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-)
-
-var (
-	// Metrics
-	cacheHits = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "storage_cache_hits_total",
-		Help: "The total number of cache hits",
-	})
-	cacheMisses = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "storage_cache_misses_total",
-		Help: "The total number of cache misses",
-	})
-	operationDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "storage_operation_duration_seconds",
-		Help:    "Duration of storage operations",
-		Buckets: prometheus.DefBuckets,
-	}, []string{"operation"})
 )
 
 // Config holds configuration for the storage manager
@@ -55,9 +36,6 @@ type Manager struct {
 	config      Config
 	mu          sync.RWMutex
 	metrics     struct {
-		lastError    time.Time
-		errorCount   int
-		circuitOpen  bool
 		healthStatus bool
 		lastHealthy  time.Time
 	}
@@ -101,63 +79,31 @@ func NewManager(cfg Config) (*Manager, error) {
 	return m, nil
 }
 
-// BatchSet stores multiple items efficiently
+// BatchSet stores multiple items
 func (m *Manager) BatchSet(ctx context.Context, items []*storage.Item) error {
-	if len(items) == 0 {
-		return nil
-	}
-
 	start := time.Now()
 	fmt.Printf("[BatchSet] Starting batch operation with %d items\n", len(items))
 
 	// Store in vector store first
-	timer := prometheus.NewTimer(operationDuration.WithLabelValues("batch_set"))
-	defer timer.ObserveDuration()
-
-	// Vector store operation
-	vectorChan := make(chan error, 1)
-	go func() {
-		vectorStart := time.Now()
-		err := m.vectorStore.Insert(ctx, items)
-		fmt.Printf("[BatchSet] Vector store insertion took %v\n", time.Since(vectorStart))
-		vectorChan <- err
-	}()
-
-	// Cache operations in parallel
-	cacheChan := make(chan error, 1)
-	go func() {
-		cacheStart := time.Now()
-		// Convert items to map for batch operation
-		itemMap := make(map[string]*storage.Item, len(items))
-		for _, item := range items {
-			itemMap[item.ID] = item
-		}
-		err := m.cache.BatchSet(ctx, itemMap)
-		fmt.Printf("[BatchSet] Cache operations took %v\n", time.Since(cacheStart))
-		cacheChan <- err
-	}()
-
-	// Wait for both operations
-	select {
-	case err := <-vectorChan:
-		if err != nil {
-			fmt.Printf("[BatchSet] Vector store insertion failed: %v\n", err)
-			return fmt.Errorf("failed to store items in vector store: %w", err)
-		}
-	case <-ctx.Done():
-		return ctx.Err()
+	vectorStart := time.Now()
+	fmt.Printf("[BatchSet] Starting vector store insertion\n")
+	if err := m.vectorStore.Insert(ctx, items); err != nil {
+		fmt.Printf("[BatchSet] Vector store insertion failed after %v: %v\n", time.Since(vectorStart), err)
+		return fmt.Errorf("failed to store in vector store: %w", err)
 	}
+	fmt.Printf("[BatchSet] Vector store insertion completed in %v\n", time.Since(vectorStart))
 
-	// Cache errors are non-fatal
-	select {
-	case err := <-cacheChan:
-		if err != nil {
-			fmt.Printf("[BatchSet] Cache batch operation failed: %v\n", err)
+	// Then cache all items
+	cacheStart := time.Now()
+	fmt.Printf("[BatchSet] Starting cache operations\n")
+	for _, item := range items {
+		if err := m.cache.Set(ctx, item.ID, item); err != nil {
+			fmt.Printf("[BatchSet] Cache operation failed for item %s after %v: %v\n",
+				item.ID, time.Since(cacheStart), err)
+			return fmt.Errorf("failed to cache item %s: %w", item.ID, err)
 		}
-	case <-ctx.Done():
-		return ctx.Err()
 	}
-
+	fmt.Printf("[BatchSet] Cache operations took %v\n", time.Since(cacheStart))
 	fmt.Printf("[BatchSet] Total operation took %v\n", time.Since(start))
 	return nil
 }
@@ -167,171 +113,105 @@ func (m *Manager) Set(ctx context.Context, key string, item *storage.Item) error
 	return m.BatchSet(ctx, []*storage.Item{item})
 }
 
-// Get retrieves an item by its key
-func (m *Manager) Get(ctx context.Context, key string) (*storage.Item, error) {
+// Get retrieves an item by ID
+func (m *Manager) Get(ctx context.Context, id string) (*storage.Item, error) {
 	start := time.Now()
-	fmt.Printf("[Get] Starting retrieval for key: %s\n", key)
-
-	timer := prometheus.NewTimer(operationDuration.WithLabelValues("get"))
-	defer timer.ObserveDuration()
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	fmt.Printf("[Get] Starting retrieval for ID: %s\n", id)
 
 	// Try cache first
 	cacheStart := time.Now()
-	item, err := m.cache.Get(ctx, key)
+	item, err := m.cache.Get(ctx, id)
 	cacheDuration := time.Since(cacheStart)
 
 	if err == nil && item != nil {
-		cacheHits.Inc()
-		fmt.Printf("[Get] Cache hit for key %s, took %v\n", key, cacheDuration)
-		// Convert metadata types
-		if item.Metadata != nil {
-			for k, v := range item.Metadata {
-				if f, ok := v.(float64); ok && f == float64(int64(f)) {
-					item.Metadata[k] = int(f)
-				}
-			}
-		}
+		fmt.Printf("[Get] Cache hit for %s in %v\n", id, cacheDuration)
 		return item, nil
 	}
-	cacheMisses.Inc()
-	fmt.Printf("[Get] Cache miss for key %s, took %v\n", key, cacheDuration)
+	fmt.Printf("[Get] Cache miss for %s in %v\n", id, cacheDuration)
 
-	// Cache miss, try vector store
+	// Fallback to vector store
 	vectorStart := time.Now()
-	item, err = m.vectorStore.GetByID(ctx, key)
-	fmt.Printf("[Get] Vector store lookup took %v\n", time.Since(vectorStart))
-
+	fmt.Printf("[Get] Falling back to vector store for %s\n", id)
+	item, err = m.vectorStore.GetByID(ctx, id)
 	if err != nil {
-		fmt.Printf("[Get] Vector store error: %v\n", err)
-		return nil, fmt.Errorf("failed to get item from vector store: %w", err)
+		fmt.Printf("[Get] Vector store retrieval failed after %v: %v\n", time.Since(vectorStart), err)
+		return nil, fmt.Errorf("failed to get from vector store: %w", err)
 	}
-	if item == nil {
-		fmt.Printf("[Get] Item not found in vector store\n")
-		return nil, nil
-	}
+	fmt.Printf("[Get] Vector store retrieval took %v\n", time.Since(vectorStart))
 
-	// Convert metadata types before caching
-	if item.Metadata != nil {
-		for k, v := range item.Metadata {
-			if f, ok := v.(float64); ok && f == float64(int64(f)) {
-				item.Metadata[k] = int(f)
-			}
+	if item != nil {
+		// Update cache with found item
+		cacheUpdateStart := time.Now()
+		if err := m.cache.Set(ctx, id, item); err != nil {
+			fmt.Printf("[Get] Cache update failed after %v: %v\n", time.Since(cacheUpdateStart), err)
+			// Log but don't fail on cache update error
+		} else {
+			fmt.Printf("[Get] Cache updated in %v\n", time.Since(cacheUpdateStart))
 		}
 	}
 
-	// Cache the item for future requests
-	cacheStart = time.Now()
-	if err := m.cache.Set(ctx, key, item); err != nil {
-		fmt.Printf("[Get] Failed to cache item %s: %v\n", key, err)
-	}
-	fmt.Printf("[Get] Cache set took %v\n", time.Since(cacheStart))
 	fmt.Printf("[Get] Total operation took %v\n", time.Since(start))
-
 	return item, nil
 }
 
-// Search performs a similarity search
+// Search performs a vector similarity search
 func (m *Manager) Search(ctx context.Context, vector []float32, limit int) ([]*storage.Item, error) {
-	timer := prometheus.NewTimer(operationDuration.WithLabelValues("search"))
-	defer timer.ObserveDuration()
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if m.metrics.circuitOpen {
-		return nil, fmt.Errorf("circuit breaker is open")
-	}
-
-	// Generate cache key for this search
-	cacheKey := fmt.Sprintf("search:%x:%d", vector, limit)
-
-	// Try cache first
-	if cached, err := m.cache.Get(ctx, cacheKey); err == nil && cached != nil {
-		cacheHits.Inc()
-		// For searches, we store the results as a special type
-		if results, ok := cached.Metadata["search_results"].([]*storage.Item); ok {
-			return results, nil
-		}
-	}
+	start := time.Now()
+	fmt.Printf("[Search] Starting search with vector dimension %d, limit %d\n", len(vector), limit)
 
 	// Perform search
-	items, err := m.vectorStore.Search(ctx, vector, limit)
+	searchStart := time.Now()
+	fmt.Printf("[Search] Executing vector store search\n")
+	results, err := m.vectorStore.Search(ctx, vector, limit)
 	if err != nil {
-		m.recordError()
-		return nil, fmt.Errorf("vector store search failed: %w", err)
+		fmt.Printf("[Search] Vector store search failed after %v: %v\n", time.Since(searchStart), err)
+		return nil, fmt.Errorf("failed to perform vector search: %w", err)
+	}
+	fmt.Printf("[Search] Vector store search completed in %v\n", time.Since(searchStart))
+
+	// Update cache with results
+	if len(results) > 0 {
+		cacheStart := time.Now()
+		fmt.Printf("[Search] Updating cache with %d results\n", len(results))
+		for _, item := range results {
+			if err := m.cache.Set(ctx, item.ID, item); err != nil {
+				fmt.Printf("[Search] Cache update failed for item %s after %v: %v\n",
+					item.ID, time.Since(cacheStart), err)
+				// Log but don't fail on cache update error
+			}
+		}
+		fmt.Printf("[Search] Cache updates completed in %v\n", time.Since(cacheStart))
 	}
 
-	// Cache results
-	cacheItem := &storage.Item{
-		ID: cacheKey,
-		Metadata: map[string]interface{}{
-			"search_results": items,
-		},
-		ExpiresAt: time.Now().Add(m.config.Cache.Config.DefaultTTL),
-	}
-	if err := m.cache.Set(ctx, cacheKey, cacheItem); err != nil {
-		fmt.Printf("warning: failed to cache search results: %v\n", err)
-	}
-
-	return items, nil
+	fmt.Printf("[Search] Total operation took %v\n", time.Since(start))
+	return results, nil
 }
 
-// DeleteFromStore removes items from both the vector store and cache
+// DeleteFromStore removes items from both stores
 func (m *Manager) DeleteFromStore(ctx context.Context, ids []string) error {
-	if len(ids) == 0 {
-		return nil
-	}
-
 	start := time.Now()
 	fmt.Printf("[Delete] Starting deletion of %d items\n", len(ids))
 
-	timer := prometheus.NewTimer(operationDuration.WithLabelValues("delete"))
-	defer timer.ObserveDuration()
+	// Delete from vector store first
+	vectorStart := time.Now()
+	fmt.Printf("[Delete] Starting vector store deletion\n")
+	if err := m.vectorStore.DeleteFromStore(ctx, ids); err != nil {
+		fmt.Printf("[Delete] Vector store deletion failed after %v: %v\n", time.Since(vectorStart), err)
+		return fmt.Errorf("failed to delete from vector store: %w", err)
+	}
+	fmt.Printf("[Delete] Vector store deletion completed in %v\n", time.Since(vectorStart))
 
-	// Delete from cache and vector store concurrently
-	var wg sync.WaitGroup
-	errChan := make(chan error, 2)
-
-	// Cache deletion
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		cacheStart := time.Now()
-		if err := m.cache.BatchDelete(ctx, ids); err != nil {
-			fmt.Printf("[Delete] Cache batch deletion failed: %v\n", err)
-			errChan <- fmt.Errorf("cache deletion failed: %w", err)
-		}
-		fmt.Printf("[Delete] Cache deletion took %v\n", time.Since(cacheStart))
-	}()
-
-	// Vector store deletion
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		vectorStart := time.Now()
-		if err := m.vectorStore.DeleteFromStore(ctx, ids); err != nil {
-			fmt.Printf("[Delete] Vector store deletion failed: %v\n", err)
-			errChan <- fmt.Errorf("vector store deletion failed: %w", err)
-		}
-		fmt.Printf("[Delete] Vector store deletion took %v\n", time.Since(vectorStart))
-	}()
-
-	// Wait for all operations to complete
-	go func() {
-		wg.Wait()
-		close(errChan)
-	}()
-
-	// Check for errors
-	for err := range errChan {
-		if err != nil {
-			return err
+	// Then remove from cache
+	cacheStart := time.Now()
+	fmt.Printf("[Delete] Starting cache deletion\n")
+	for _, id := range ids {
+		if err := m.cache.DeleteFromCache(ctx, id); err != nil {
+			fmt.Printf("[Delete] Cache deletion failed for item %s after %v: %v\n",
+				id, time.Since(cacheStart), err)
+			return fmt.Errorf("failed to delete from cache: %w", err)
 		}
 	}
-
+	fmt.Printf("[Delete] Cache deletion completed in %v\n", time.Since(cacheStart))
 	fmt.Printf("[Delete] Total operation took %v\n", time.Since(start))
 	return nil
 }
@@ -422,26 +302,6 @@ func (m *Manager) warmCache() {
 		// This is a placeholder - implement based on your specific needs
 		fmt.Printf("Warming cache with query: %s\n", query)
 	}
-}
-
-// Circuit breaker methods
-
-func (m *Manager) recordError() {
-	m.metrics.lastError = time.Now()
-	m.metrics.errorCount++
-
-	if m.metrics.errorCount >= m.config.MaxRetries {
-		m.metrics.circuitOpen = true
-		go m.resetCircuitBreaker()
-	}
-}
-
-func (m *Manager) resetCircuitBreaker() {
-	time.Sleep(m.config.BreakDuration)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.metrics.circuitOpen = false
-	m.metrics.errorCount = 0
 }
 
 // TriggerCacheWarmup manually triggers cache warming

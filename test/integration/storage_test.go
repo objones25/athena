@@ -19,6 +19,9 @@ func TestStorageIntegration(t *testing.T) {
 		t.Skip("Skipping integration test in short mode")
 	}
 
+	startTime := time.Now()
+	t.Logf("Starting integration test at %v", startTime)
+
 	// Initialize components
 	redisConfig := cache.Config{
 		Host:                 "localhost",
@@ -39,6 +42,9 @@ func TestStorageIntegration(t *testing.T) {
 		MaxRetries:     3,
 		PoolSize:       5,
 	}
+
+	t.Logf("Initializing manager with Redis config: %+v", redisConfig)
+	t.Logf("Initializing manager with Milvus config: %+v", milvusConfig)
 
 	managerConfig := manager.Config{
 		Cache: struct {
@@ -61,14 +67,19 @@ func TestStorageIntegration(t *testing.T) {
 		HealthInterval: time.Minute,
 	}
 
+	initStart := time.Now()
 	mgr, err := manager.NewManager(managerConfig)
+	t.Logf("Manager initialization took %v", time.Since(initStart))
 	require.NoError(t, err)
 	defer mgr.Close()
 
 	ctx := context.Background()
 
 	t.Run("End-to-End Flow", func(t *testing.T) {
+		t.Logf("Starting End-to-End Flow test at %v", time.Now())
+
 		// Create test items
+		itemStart := time.Now()
 		items := make([]*storage.Item, 10)
 		for i := 0; i < 10; i++ {
 			items[i] = &storage.Item{
@@ -80,7 +91,7 @@ func TestStorageIntegration(t *testing.T) {
 						"encoding": "utf-8",
 					},
 				},
-				Vector:    make([]float32, 128), // Fill with test data
+				Vector:    make([]float32, 128),
 				Metadata:  map[string]interface{}{"test": i},
 				CreatedAt: time.Now(),
 				ExpiresAt: time.Now().Add(time.Hour),
@@ -90,14 +101,21 @@ func TestStorageIntegration(t *testing.T) {
 				items[i].Vector[j] = float32(i) * 0.1
 			}
 		}
+		t.Logf("Item creation took %v", time.Since(itemStart))
 
 		// Test insertion
+		insertStart := time.Now()
 		err = mgr.BatchSet(ctx, items)
+		t.Logf("Batch insertion took %v", time.Since(insertStart))
 		require.NoError(t, err)
 
 		// Test retrieval
+		retrievalStart := time.Now()
+		var retrievalTimes []time.Duration
 		for _, item := range items {
+			itemStart := time.Now()
 			retrieved, err := mgr.Get(ctx, item.ID)
+			retrievalTimes = append(retrievalTimes, time.Since(itemStart))
 			require.NoError(t, err)
 			assert.NotNil(t, retrieved)
 			assert.Equal(t, item.ID, retrieved.ID)
@@ -106,9 +124,15 @@ func TestStorageIntegration(t *testing.T) {
 			assert.Equal(t, item.Vector, retrieved.Vector)
 			assert.Equal(t, item.Metadata["test"], retrieved.Metadata["test"])
 		}
+		totalRetrievalTime := time.Since(retrievalStart)
+		t.Logf("Total retrieval took %v", totalRetrievalTime)
+		t.Logf("Average retrieval time: %v", totalRetrievalTime/time.Duration(len(items)))
+		t.Logf("Individual retrieval times: %v", retrievalTimes)
 
 		// Test vector search
+		searchStart := time.Now()
 		results, err := mgr.Search(ctx, items[0].Vector, 5)
+		t.Logf("Vector search took %v", time.Since(searchStart))
 		require.NoError(t, err)
 		assert.NotEmpty(t, results)
 		assert.LessOrEqual(t, len(results), 5)
@@ -118,25 +142,33 @@ func TestStorageIntegration(t *testing.T) {
 		for i := 0; i < 5; i++ {
 			idsToDelete[i] = items[i].ID
 		}
+		deleteStart := time.Now()
 		err = mgr.DeleteFromStore(ctx, idsToDelete)
+		t.Logf("Batch deletion took %v", time.Since(deleteStart))
 		require.NoError(t, err)
 
 		// Verify deletions
+		verifyStart := time.Now()
 		for i := 0; i < 5; i++ {
 			retrieved, err := mgr.Get(ctx, items[i].ID)
 			require.NoError(t, err)
 			assert.Nil(t, retrieved)
 		}
+		t.Logf("Deletion verification took %v", time.Since(verifyStart))
 
 		// Verify remaining items
+		remainingStart := time.Now()
 		for i := 5; i < 10; i++ {
 			retrieved, err := mgr.Get(ctx, items[i].ID)
 			require.NoError(t, err)
 			assert.NotNil(t, retrieved)
 		}
+		t.Logf("Remaining items verification took %v", time.Since(remainingStart))
 	})
 
 	t.Run("Consistency Check", func(t *testing.T) {
+		t.Logf("Starting Consistency Check test at %v", time.Now())
+
 		// Create test item
 		item := &storage.Item{
 			ID: "consistency_test",
@@ -151,15 +183,21 @@ func TestStorageIntegration(t *testing.T) {
 		}
 
 		// Store item
+		storeStart := time.Now()
 		err := mgr.Set(ctx, item.ID, item)
+		t.Logf("Item storage took %v", time.Since(storeStart))
 		require.NoError(t, err)
 
 		// Verify in both stores
+		cacheStart := time.Now()
 		cached, err := mgr.Get(ctx, item.ID)
+		t.Logf("Cache retrieval took %v", time.Since(cacheStart))
 		require.NoError(t, err)
 		assert.NotNil(t, cached)
 
+		searchStart := time.Now()
 		results, err := mgr.Search(ctx, item.Vector, 1)
+		t.Logf("Vector search took %v", time.Since(searchStart))
 		require.NoError(t, err)
 		assert.NotEmpty(t, results)
 
@@ -170,6 +208,8 @@ func TestStorageIntegration(t *testing.T) {
 	})
 
 	t.Run("Error Recovery", func(t *testing.T) {
+		t.Logf("Starting Error Recovery test at %v", time.Now())
+
 		// Create test item
 		item := &storage.Item{
 			ID: "error_recovery_test",
@@ -183,15 +223,21 @@ func TestStorageIntegration(t *testing.T) {
 		}
 
 		// Test health check
+		healthStart := time.Now()
 		err := mgr.Health(ctx)
+		t.Logf("Health check took %v", time.Since(healthStart))
 		require.NoError(t, err)
 
 		// Store item
+		storeStart := time.Now()
 		err = mgr.Set(ctx, item.ID, item)
+		t.Logf("Item storage took %v", time.Since(storeStart))
 		require.NoError(t, err)
 
 		// Verify storage
+		verifyStart := time.Now()
 		retrieved, err := mgr.Get(ctx, item.ID)
+		t.Logf("Item verification took %v", time.Since(verifyStart))
 		require.NoError(t, err)
 		assert.NotNil(t, retrieved)
 		assert.Equal(t, item.ID, retrieved.ID)
@@ -330,4 +376,6 @@ func TestStorageIntegration(t *testing.T) {
 			})
 		}
 	})
+
+	t.Logf("Total test duration: %v", time.Since(startTime))
 }
