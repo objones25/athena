@@ -1,5 +1,3 @@
-You raise a good point about Docker vs Makefile. For this project, I recommend starting with a Makefile since it's simpler and sufficient for local development. We can add Docker later when we need more complex deployment scenarios or want to ensure consistent environments. Let me provide an expanded README.md that incorporates our previous discussions and additional important sections.
-
 ```markdown
 # Athena - An Intelligent STEM Knowledge Assistant
 
