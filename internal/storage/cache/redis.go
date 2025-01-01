@@ -316,7 +316,11 @@ func (rc *RedisCache) DeleteFromCache(ctx context.Context, key string) error {
 	if key == "" {
 		return ErrEmptyKey
 	}
-	return rc.client.Del(ctx, key).Err()
+	pipe := rc.client.Pipeline()
+	pipe.Del(ctx, key)
+	pipe.Del(ctx, "compressed:"+key)
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 func (rc *RedisCache) Clear(ctx context.Context) error {
