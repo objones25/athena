@@ -9,15 +9,29 @@ import (
 
 	"github.com/objones25/athena/internal/storage"
 	"github.com/objones25/athena/internal/storage/mock"
+	"github.com/objones25/athena/test/testutil"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMain(m *testing.M) {
+	// Initialize test logger
+	testutil.InitTestLogger()
+	// Set default test log level
+	testutil.SetLogLevel(testutil.ParseLogLevel(zerolog.WarnLevel))
+	m.Run()
+}
 
 func TestStorageOperations(t *testing.T) {
 	store := mock.NewMockStore()
 	ctx := context.Background()
 
 	t.Run("Basic Operations", func(t *testing.T) {
+		// Set debug level for this specific test
+		cleanup := testutil.TestLogLevel(t, zerolog.DebugLevel)
+		defer cleanup()
+
 		// Test item creation
 		item := &storage.Item{
 			ID: "test1",

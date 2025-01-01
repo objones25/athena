@@ -1445,7 +1445,8 @@ func (s *MilvusStore) Close() error {
 func (s *MilvusStore) processLargeBatch(ctx context.Context, items []*storage.Item) error {
 	start := time.Now()
 	totalItems := len(items)
-	fmt.Printf("[Milvus:LargeBatch] Starting large batch processing of %d items\n", totalItems)
+	logger := s.logger.With().Int("total_items", totalItems).Logger()
+	logger.Debug().Msg("Starting large batch processing")
 
 	const optimalBatchSize = 2000
 	batches := (totalItems + optimalBatchSize - 1) / optimalBatchSize
@@ -1465,8 +1466,13 @@ func (s *MilvusStore) processLargeBatch(ctx context.Context, items []*storage.It
 		}
 		batch := items[i:end]
 		batchSize := len(batch)
-		fmt.Printf("[Milvus:LargeBatch] Processing batch %d/%d (%d items)\n",
-			(i/optimalBatchSize)+1, batches, batchSize)
+		batchLogger := logger.With().
+			Int("batch_number", (i/optimalBatchSize)+1).
+			Int("total_batches", batches).
+			Int("batch_size", batchSize).
+			Logger()
+
+		batchLogger.Debug().Msg("Processing batch")
 
 		// Pre-allocate all slices for the batch
 		ids := make([]string, batchSize)
@@ -1477,48 +1483,18 @@ func (s *MilvusStore) processLargeBatch(ctx context.Context, items []*storage.It
 		createdAt := make([]int64, batchSize)
 		expiresAt := make([]int64, batchSize)
 
-		// Process items in parallel
-		processStart := time.Now()
-		fmt.Printf("[Milvus:LargeBatch] Starting concurrent item processing for batch %d\n",
-			(i/optimalBatchSize)+1)
-		errChan := make(chan error, runtime.NumCPU())
-		sem := make(chan struct{}, runtime.NumCPU())
-
+		// Process items
 		for j := range batch {
-			sem <- struct{}{} // Acquire semaphore
-			go func(j int) {
-				defer func() { <-sem }() // Release semaphore
-
-				if err := ctx.Err(); err != nil {
-					errChan <- fmt.Errorf("context cancelled during processing: %w", err)
-					return
-				}
-
-				ids[j] = batch[j].ID
-				vectors[j] = batch[j].Vector
-				contentTypes[j] = string(batch[j].Content.Type)
-				contentData[j] = string(batch[j].Content.Data)
-				metadata[j] = encodeMetadata(batch[j].Metadata)
-				createdAt[j] = batch[j].CreatedAt.UnixNano()
-				expiresAt[j] = batch[j].ExpiresAt.UnixNano()
-
-				errChan <- nil
-			}(j)
+			ids[j] = batch[j].ID
+			vectors[j] = batch[j].Vector
+			contentTypes[j] = string(batch[j].Content.Type)
+			contentData[j] = string(batch[j].Content.Data)
+			metadata[j] = encodeMetadata(batch[j].Metadata)
+			createdAt[j] = batch[j].CreatedAt.UnixNano()
+			expiresAt[j] = batch[j].ExpiresAt.UnixNano()
 		}
-
-		// Wait for all goroutines and check for errors
-		for j := 0; j < len(batch); j++ {
-			if err := <-errChan; err != nil {
-				return err
-			}
-		}
-		fmt.Printf("[Milvus:LargeBatch] Batch %d item processing completed in %v\n",
-			(i/optimalBatchSize)+1, time.Since(processStart))
 
 		// Create columns
-		columnStart := time.Now()
-		fmt.Printf("[Milvus:LargeBatch] Creating column data for batch %d\n",
-			(i/optimalBatchSize)+1)
 		idCol := entity.NewColumnVarChar("id", ids)
 		vectorCol := entity.NewColumnFloatVector("vector", s.dimension, vectors)
 		contentTypeCol := entity.NewColumnVarChar("content_type", contentTypes)
@@ -1526,59 +1502,46 @@ func (s *MilvusStore) processLargeBatch(ctx context.Context, items []*storage.It
 		metadataCol := entity.NewColumnVarChar("metadata", metadata)
 		createdAtCol := entity.NewColumnInt64("created_at", createdAt)
 		expiresAtCol := entity.NewColumnInt64("expires_at", expiresAt)
-		fmt.Printf("[Milvus:LargeBatch] Column data created in %v\n", time.Since(columnStart))
 
 		// Insert data
 		insertStart := time.Now()
-		fmt.Printf("[Milvus:LargeBatch] Starting insert for batch %d\n",
-			(i/optimalBatchSize)+1)
+		batchLogger.Debug().Msg("Starting batch insert")
 		_, err = conn.Insert(ctx, s.collection, "", idCol, vectorCol, contentTypeCol,
 			contentDataCol, metadataCol, createdAtCol, expiresAtCol)
 		if err != nil {
-			fmt.Printf("[Milvus:LargeBatch] Batch %d insert failed after %v: %v\n",
-				(i/optimalBatchSize)+1, time.Since(insertStart), err)
+			batchLogger.Error().
+				Err(err).
+				Dur("duration", time.Since(insertStart)).
+				Msg("Batch insert failed")
 			return fmt.Errorf("failed to insert batch: %w", err)
 		}
-		fmt.Printf("[Milvus:LargeBatch] Batch %d inserted in %v\n",
-			(i/optimalBatchSize)+1, time.Since(insertStart))
+		batchLogger.Debug().
+			Dur("duration", time.Since(insertStart)).
+			Msg("Batch inserted")
 
-		fmt.Printf("[Milvus:LargeBatch] Batch %d completed in %v\n",
-			(i/optimalBatchSize)+1, time.Since(batchStart))
+		batchLogger.Debug().
+			Dur("duration", time.Since(batchStart)).
+			Msg("Batch completed")
 	}
 
 	// Flush after all batches are inserted
 	flushStart := time.Now()
-	fmt.Printf("[Milvus:LargeBatch] Starting final flush\n")
+	logger.Debug().Msg("Starting final flush")
 	if err := conn.Flush(ctx, s.collection, false); err != nil {
-		fmt.Printf("[Milvus:LargeBatch] Final flush failed after %v: %v\n",
-			time.Since(flushStart), err)
+		logger.Error().
+			Err(err).
+			Dur("duration", time.Since(flushStart)).
+			Msg("Final flush failed")
 		return fmt.Errorf("failed to flush after insertion: %w", err)
 	}
-	fmt.Printf("[Milvus:LargeBatch] Final flush completed in %v\n", time.Since(flushStart))
+	logger.Debug().
+		Dur("duration", time.Since(flushStart)).
+		Msg("Final flush completed")
 
-	// Verify a sample of items
-	if totalItems > 10 {
-		sampleSize := 5
-		sampleIndices := make([]int, sampleSize)
-		step := totalItems / sampleSize
-		for i := range sampleIndices {
-			sampleIndices[i] = i * step
-		}
+	logger.Debug().
+		Dur("duration", time.Since(start)).
+		Msg("Large batch processing completed")
 
-		verifyStart := time.Now()
-		fmt.Printf("[Milvus:LargeBatch] Starting sample verification of %d items\n", sampleSize)
-		for _, idx := range sampleIndices {
-			if err := s.verifyItem(ctx, items[idx].ID); err != nil {
-				fmt.Printf("[Milvus:LargeBatch] Sample verification failed after %v: %v\n",
-					time.Since(verifyStart), err)
-				return fmt.Errorf("sample verification failed: %w", err)
-			}
-		}
-		fmt.Printf("[Milvus:LargeBatch] Sample verification completed in %v\n",
-			time.Since(verifyStart))
-	}
-
-	fmt.Printf("[Milvus:LargeBatch] Total large batch processing took %v\n", time.Since(start))
 	return nil
 }
 

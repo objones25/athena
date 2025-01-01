@@ -9,6 +9,7 @@ import (
 	"github.com/objones25/athena/internal/storage"
 	"github.com/objones25/athena/internal/storage/cache"
 	"github.com/objones25/athena/internal/storage/milvus"
+	"github.com/rs/zerolog/log"
 )
 
 // Config holds configuration for the storage manager
@@ -45,21 +46,22 @@ type Manager struct {
 
 // NewManager creates a new storage manager with the provided configuration
 func NewManager(cfg Config) (*Manager, error) {
-	fmt.Printf("Initializing storage manager with config: %+v\n", cfg)
+	logger := log.With().Str("component", "storage_manager").Logger()
+	logger.Debug().Interface("config", cfg).Msg("Initializing storage manager")
 
-	fmt.Printf("Creating Redis cache...\n")
+	logger.Debug().Msg("Creating Redis cache")
 	cache, err := cache.NewRedisCache(cfg.Cache.Config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cache: %w", err)
 	}
-	fmt.Printf("Redis cache created successfully\n")
+	logger.Debug().Msg("Redis cache created successfully")
 
-	fmt.Printf("Creating Milvus vector store...\n")
+	logger.Debug().Msg("Creating Milvus vector store")
 	vectorStore, err := milvus.NewMilvusStore(cfg.VectorStore.Config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create vector store: %w", err)
 	}
-	fmt.Printf("Milvus vector store created successfully\n")
+	logger.Debug().Msg("Milvus vector store created successfully")
 
 	m := &Manager{
 		cache:       cache,
@@ -69,42 +71,61 @@ func NewManager(cfg Config) (*Manager, error) {
 		warmupChan:  make(chan struct{}, 1),
 	}
 
-	fmt.Printf("Starting background tasks...\n")
+	logger.Debug().Msg("Starting background tasks")
 	// Start background tasks
 	go m.healthCheck()
 	go m.cacheWarmer()
-	fmt.Printf("Background tasks started\n")
+	logger.Debug().Msg("Background tasks started")
 
-	fmt.Printf("Storage manager initialized successfully\n")
+	logger.Info().Msg("Storage manager initialized successfully")
 	return m, nil
 }
 
 // BatchSet stores multiple items
 func (m *Manager) BatchSet(ctx context.Context, items []*storage.Item) error {
 	start := time.Now()
-	fmt.Printf("[BatchSet] Starting batch operation with %d items\n", len(items))
+	logger := log.With().
+		Str("component", "storage_manager").
+		Str("operation", "batch_set").
+		Int("item_count", len(items)).
+		Logger()
+
+	logger.Debug().Msg("Starting batch operation")
 
 	// Store in vector store first
 	vectorStart := time.Now()
-	fmt.Printf("[BatchSet] Starting vector store insertion\n")
+	logger.Debug().Msg("Starting vector store insertion")
 	if err := m.vectorStore.BatchSet(ctx, items); err != nil {
-		fmt.Printf("[BatchSet] Vector store insertion failed after %v: %v\n", time.Since(vectorStart), err)
+		logger.Error().
+			Err(err).
+			Dur("duration", time.Since(vectorStart)).
+			Msg("Vector store insertion failed")
 		return fmt.Errorf("failed to store in vector store: %w", err)
 	}
-	fmt.Printf("[BatchSet] Vector store insertion completed in %v\n", time.Since(vectorStart))
+	logger.Debug().
+		Dur("duration", time.Since(vectorStart)).
+		Msg("Vector store insertion completed")
 
 	// Then cache all items
 	cacheStart := time.Now()
-	fmt.Printf("[BatchSet] Starting cache operations\n")
+	logger.Debug().Msg("Starting cache operations")
 	for _, item := range items {
 		if err := m.cache.Set(ctx, item.ID, item); err != nil {
-			fmt.Printf("[BatchSet] Cache operation failed for item %s after %v: %v\n",
-				item.ID, time.Since(cacheStart), err)
+			logger.Error().
+				Err(err).
+				Str("item_id", item.ID).
+				Dur("duration", time.Since(cacheStart)).
+				Msg("Cache operation failed")
 			return fmt.Errorf("failed to cache item %s: %w", item.ID, err)
 		}
 	}
-	fmt.Printf("[BatchSet] Cache operations took %v\n", time.Since(cacheStart))
-	fmt.Printf("[BatchSet] Total operation took %v\n", time.Since(start))
+	logger.Debug().
+		Dur("duration", time.Since(cacheStart)).
+		Msg("Cache operations completed")
+
+	logger.Debug().
+		Dur("duration", time.Since(start)).
+		Msg("Total batch operation completed")
 	return nil
 }
 
@@ -116,7 +137,13 @@ func (m *Manager) Set(ctx context.Context, key string, item *storage.Item) error
 // Get retrieves an item by ID
 func (m *Manager) Get(ctx context.Context, id string) (*storage.Item, error) {
 	start := time.Now()
-	fmt.Printf("[Get] Starting retrieval for ID: %s\n", id)
+	logger := log.With().
+		Str("component", "storage_manager").
+		Str("operation", "get").
+		Str("id", id).
+		Logger()
+
+	logger.Debug().Msg("Starting retrieval")
 
 	// Try cache first
 	cacheStart := time.Now()
@@ -124,33 +151,49 @@ func (m *Manager) Get(ctx context.Context, id string) (*storage.Item, error) {
 	cacheDuration := time.Since(cacheStart)
 
 	if err == nil && item != nil {
-		fmt.Printf("[Get] Cache hit for %s in %v\n", id, cacheDuration)
+		logger.Debug().
+			Dur("duration", cacheDuration).
+			Msg("Cache hit")
 		return item, nil
 	}
-	fmt.Printf("[Get] Cache miss for %s in %v\n", id, cacheDuration)
+	logger.Debug().
+		Dur("duration", cacheDuration).
+		Msg("Cache miss")
 
 	// Fallback to vector store
 	vectorStart := time.Now()
-	fmt.Printf("[Get] Falling back to vector store for %s\n", id)
+	logger.Debug().Msg("Falling back to vector store")
 	item, err = m.vectorStore.GetByID(ctx, id)
 	if err != nil {
-		fmt.Printf("[Get] Vector store retrieval failed after %v: %v\n", time.Since(vectorStart), err)
+		logger.Error().
+			Err(err).
+			Dur("duration", time.Since(vectorStart)).
+			Msg("Vector store retrieval failed")
 		return nil, fmt.Errorf("failed to get from vector store: %w", err)
 	}
-	fmt.Printf("[Get] Vector store retrieval took %v\n", time.Since(vectorStart))
+	logger.Debug().
+		Dur("duration", time.Since(vectorStart)).
+		Msg("Vector store retrieval completed")
 
 	if item != nil {
 		// Update cache with found item
 		cacheUpdateStart := time.Now()
 		if err := m.cache.Set(ctx, id, item); err != nil {
-			fmt.Printf("[Get] Cache update failed after %v: %v\n", time.Since(cacheUpdateStart), err)
+			logger.Warn().
+				Err(err).
+				Dur("duration", time.Since(cacheUpdateStart)).
+				Msg("Cache update failed")
 			// Log but don't fail on cache update error
 		} else {
-			fmt.Printf("[Get] Cache updated in %v\n", time.Since(cacheUpdateStart))
+			logger.Debug().
+				Dur("duration", time.Since(cacheUpdateStart)).
+				Msg("Cache updated")
 		}
 	}
 
-	fmt.Printf("[Get] Total operation took %v\n", time.Since(start))
+	logger.Debug().
+		Dur("duration", time.Since(start)).
+		Msg("Total operation completed")
 	return item, nil
 }
 
@@ -190,60 +233,99 @@ func (m *Manager) Search(ctx context.Context, vector []float32, limit int) ([]*s
 // DeleteFromStore removes items from both stores
 func (m *Manager) DeleteFromStore(ctx context.Context, ids []string) error {
 	start := time.Now()
-	fmt.Printf("[Delete] Starting deletion of %d items: %v\n", len(ids), ids)
+	logger := log.With().
+		Str("component", "storage_manager").
+		Str("operation", "delete").
+		Interface("ids", ids).
+		Logger()
+
+	logger.Debug().
+		Int("count", len(ids)).
+		Msg("Starting deletion")
 
 	// Verify items exist before deletion
 	verifyStart := time.Now()
-	fmt.Printf("[Delete] Verifying items before deletion\n")
+	logger.Debug().Msg("Verifying items before deletion")
 	for _, id := range ids {
 		item, err := m.Get(ctx, id)
 		if err != nil {
-			fmt.Printf("[Delete] Error verifying item %s: %v\n", id, err)
+			logger.Warn().
+				Err(err).
+				Str("id", id).
+				Msg("Error verifying item")
 		} else if item != nil {
-			fmt.Printf("[Delete] Found item %s before deletion\n", id)
+			logger.Debug().
+				Str("id", id).
+				Msg("Found item before deletion")
 		} else {
-			fmt.Printf("[Delete] Item %s not found before deletion\n", id)
+			logger.Debug().
+				Str("id", id).
+				Msg("Item not found before deletion")
 		}
 	}
-	fmt.Printf("[Delete] Pre-deletion verification took %v\n", time.Since(verifyStart))
+	logger.Debug().
+		Dur("duration", time.Since(verifyStart)).
+		Msg("Pre-deletion verification completed")
 
 	// Delete from vector store first
 	vectorStart := time.Now()
-	fmt.Printf("[Delete] Starting vector store deletion\n")
+	logger.Debug().Msg("Starting vector store deletion")
 	if err := m.vectorStore.DeleteFromStore(ctx, ids); err != nil {
-		fmt.Printf("[Delete] Vector store deletion failed after %v: %v\n", time.Since(vectorStart), err)
+		logger.Error().
+			Err(err).
+			Dur("duration", time.Since(vectorStart)).
+			Msg("Vector store deletion failed")
 		return fmt.Errorf("failed to delete from vector store: %w", err)
 	}
-	fmt.Printf("[Delete] Vector store deletion completed in %v\n", time.Since(vectorStart))
+	logger.Debug().
+		Dur("duration", time.Since(vectorStart)).
+		Msg("Vector store deletion completed")
 
 	// Then remove from cache
 	cacheStart := time.Now()
-	fmt.Printf("[Delete] Starting cache deletion\n")
+	logger.Debug().Msg("Starting cache deletion")
 	for _, id := range ids {
 		if err := m.cache.DeleteFromCache(ctx, id); err != nil {
-			fmt.Printf("[Delete] Cache deletion failed for item %s after %v: %v\n",
-				id, time.Since(cacheStart), err)
+			logger.Error().
+				Err(err).
+				Str("id", id).
+				Dur("duration", time.Since(cacheStart)).
+				Msg("Cache deletion failed")
 			return fmt.Errorf("failed to delete from cache: %w", err)
 		}
 	}
-	fmt.Printf("[Delete] Cache deletion completed in %v\n", time.Since(cacheStart))
+	logger.Debug().
+		Dur("duration", time.Since(cacheStart)).
+		Msg("Cache deletion completed")
 
 	// Verify items are deleted
 	verifyStart = time.Now()
-	fmt.Printf("[Delete] Verifying items after deletion\n")
+	logger.Debug().Msg("Verifying items after deletion")
 	for _, id := range ids {
 		item, err := m.Get(ctx, id)
 		if err != nil {
-			fmt.Printf("[Delete] Error verifying deletion of item %s: %v\n", id, err)
+			logger.Warn().
+				Err(err).
+				Str("id", id).
+				Msg("Error verifying deletion")
 		} else if item != nil {
-			fmt.Printf("[Delete] WARNING: Item %s still exists after deletion: %+v\n", id, item)
+			logger.Warn().
+				Str("id", id).
+				Interface("item", item).
+				Msg("Item still exists after deletion")
 		} else {
-			fmt.Printf("[Delete] Confirmed deletion of item %s\n", id)
+			logger.Debug().
+				Str("id", id).
+				Msg("Confirmed deletion")
 		}
 	}
-	fmt.Printf("[Delete] Post-deletion verification took %v\n", time.Since(verifyStart))
+	logger.Debug().
+		Dur("duration", time.Since(verifyStart)).
+		Msg("Post-deletion verification completed")
 
-	fmt.Printf("[Delete] Total operation took %v\n", time.Since(start))
+	logger.Debug().
+		Dur("duration", time.Since(start)).
+		Msg("Total operation completed")
 	return nil
 }
 
