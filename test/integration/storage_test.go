@@ -138,6 +138,10 @@ func TestStorageIntegration(t *testing.T) {
 		err := mgr.Set(ctx, item.ID, item)
 		require.NoError(t, err)
 
+		// Add a small delay to ensure the item is indexed
+		logger.Info().Msg("Waiting for item to be indexed")
+		time.Sleep(500 * time.Millisecond)
+
 		// Test Get operation
 		logger.Info().Str("item_id", item.ID).Msg("Testing Get operation")
 		retrieved, err := mgr.Get(ctx, item.ID)
@@ -164,11 +168,32 @@ func TestStorageIntegration(t *testing.T) {
 		err = mgr.DeleteFromStore(ctx, []string{item.ID})
 		require.NoError(t, err)
 
-		// Verify deletion
+		// Add a small delay to ensure deletion propagates
+		time.Sleep(100 * time.Millisecond)
+
+		// Verify deletion with retries
 		logger.Info().Str("item_id", item.ID).Msg("Verifying deletion")
-		deleted, err := mgr.Get(ctx, item.ID)
+		maxRetries := 3
+		var deleted *storage.Item
+		for i := 0; i < maxRetries; i++ {
+			deleted, err = mgr.Get(ctx, item.ID)
+			require.NoError(t, err)
+			if deleted == nil {
+				break
+			}
+			logger.Warn().
+				Str("item_id", item.ID).
+				Int("retry", i+1).
+				Msg("Item still exists after deletion, retrying verification")
+			time.Sleep(time.Duration(i+1) * 100 * time.Millisecond)
+		}
+		assert.Nil(t, deleted, "Item should be deleted")
+
+		// Verify search returns no results
+		logger.Info().Msg("Verifying search after deletion")
+		results, err = mgr.Search(ctx, vector, 1)
 		require.NoError(t, err)
-		assert.Nil(t, deleted)
+		assert.Empty(t, results, "Search should return no results after deletion")
 	})
 
 	t.Run("Type_Safety", func(t *testing.T) {

@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math/rand"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -187,7 +189,13 @@ type MilvusStore struct {
 	collection     string
 	timeout        time.Duration
 	metrics        struct {
-		failedOps int64
+		failedOps       int64
+		failedInserts   int64
+		totalInsertTime int64
+		totalInserts    int64
+		cacheHits       int64
+		cacheMisses     int64
+		avgBatchSize    float64
 	}
 	workQueue *WorkQueue
 	// Add buffer for batching inserts
@@ -205,6 +213,7 @@ type MilvusStore struct {
 		// Track relationships between items
 		relationships map[string][]string
 	}
+	vectorPool *vectorBufferPool
 }
 
 // AccessPattern tracks item access history
@@ -236,6 +245,61 @@ type pooledConnection struct {
 	failures  int
 	inUse     bool
 	healthCtx context.CancelFunc
+}
+
+// vectorBufferPool manages pre-allocated vector buffers with size classes
+type vectorBufferPool struct {
+	sync.Mutex
+	buffers    map[int][][]float32
+	dimension  int
+	maxBuffers int
+}
+
+func newVectorBufferPool(dimension, maxBuffers int) *vectorBufferPool {
+	return &vectorBufferPool{
+		buffers:    make(map[int][][]float32),
+		dimension:  dimension,
+		maxBuffers: maxBuffers,
+	}
+}
+
+func (p *vectorBufferPool) get(size int) []float32 {
+	p.Lock()
+	defer p.Unlock()
+
+	// Round up to nearest power of 2 for better memory utilization
+	size = nextPowerOfTwo(size)
+
+	if buffers, ok := p.buffers[size]; ok && len(buffers) > 0 {
+		buffer := buffers[len(buffers)-1]
+		p.buffers[size] = buffers[:len(buffers)-1]
+		return buffer[:0] // Reset length but keep capacity
+	}
+
+	return make([]float32, 0, size)
+}
+
+func (p *vectorBufferPool) put(buffer []float32) {
+	p.Lock()
+	defer p.Unlock()
+
+	size := nextPowerOfTwo(cap(buffer))
+	if len(p.buffers[size]) < p.maxBuffers {
+		p.buffers[size] = append(p.buffers[size], buffer)
+	}
+}
+
+// nextPowerOfTwo returns the next power of 2 >= n
+func nextPowerOfTwo(n int) int {
+	n--
+	n |= n >> 1
+	n |= n >> 2
+	n |= n >> 4
+	n |= n >> 8
+	n |= n >> 16
+	n |= n >> 32
+	n++
+	return n
 }
 
 // NewMilvusStore creates a new Milvus store instance with the provided configuration.
@@ -293,6 +357,7 @@ func NewMilvusStore(cfg Config) (*MilvusStore, error) {
 			lastFlush: time.Now(),
 		},
 		localCache: localCache,
+		vectorPool: newVectorBufferPool(cfg.Dimension, 1000),
 	}
 
 	// Initialize access patterns tracking
@@ -636,7 +701,37 @@ func decodeMetadata(data string) map[string]interface{} {
 	return converted
 }
 
-// processBatchEfficient processes a batch of items efficiently
+// verifyItem checks if an item was successfully inserted with retries
+func (s *MilvusStore) verifyItem(ctx context.Context, id string, retries int) error {
+	var lastErr error
+	for i := 0; i < retries; i++ {
+		conn, err := s.getConnection()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to get connection for verification: %w", err)
+			continue
+		}
+
+		expr := fmt.Sprintf("id == '%s'", id)
+		result, err := conn.Query(ctx, s.collection, []string{}, expr, []string{"id"})
+		s.releaseConnection(conn)
+
+		if err != nil {
+			lastErr = fmt.Errorf("failed to verify item %s: %w", id, err)
+			time.Sleep(time.Duration(i*100) * time.Millisecond) // Exponential backoff
+			continue
+		}
+
+		if len(result) > 0 && len(result[0].(*entity.ColumnVarChar).Data()) > 0 {
+			return nil // Item found
+		}
+
+		lastErr = fmt.Errorf("item %s not found after insertion", id)
+		time.Sleep(time.Duration(i*100) * time.Millisecond)
+	}
+	return lastErr
+}
+
+// processBatchEfficient processes a batch of items efficiently with verification
 func (s *MilvusStore) processBatchEfficient(ctx context.Context, items []*storage.Item) error {
 	if len(items) == 0 {
 		return nil
@@ -649,17 +744,23 @@ func (s *MilvusStore) processBatchEfficient(ctx context.Context, items []*storag
 	}
 	defer s.releaseConnection(conn)
 
-	// Build bulk insert data
-	vectors := make([][]float32, len(items))
-	ids := make([]string, len(items))
-	contentTypes := make([]string, len(items))
-	contentData := make([]string, len(items))
-	metadata := make([]string, len(items))
-	createdAt := make([]int64, len(items))
-	expiresAt := make([]int64, len(items))
+	// Pre-allocate slices with capacity
+	batchSize := len(items)
+	vectors := make([][]float32, batchSize)
+	ids := make([]string, batchSize)
+	contentTypes := make([]string, batchSize)
+	contentData := make([]string, batchSize)
+	metadata := make([]string, batchSize)
+	createdAt := make([]int64, batchSize)
+	expiresAt := make([]int64, batchSize)
 
+	// Use vector buffer pool for vector data
 	for i, item := range items {
-		vectors[i] = item.Vector
+		// Get buffer from pool
+		vector := s.vectorPool.get(s.dimension)
+		vector = append(vector, item.Vector...)
+		vectors[i] = vector
+
 		ids[i] = item.ID
 		contentTypes[i] = string(item.Content.Type)
 		contentData[i] = string(item.Content.Data)
@@ -667,6 +768,13 @@ func (s *MilvusStore) processBatchEfficient(ctx context.Context, items []*storag
 		createdAt[i] = item.CreatedAt.UnixNano()
 		expiresAt[i] = item.ExpiresAt.UnixNano()
 	}
+
+	// Ensure vectors are returned to pool
+	defer func() {
+		for _, vec := range vectors {
+			s.vectorPool.put(vec)
+		}
+	}()
 
 	// Create column data
 	columns := []entity.Column{
@@ -679,20 +787,61 @@ func (s *MilvusStore) processBatchEfficient(ctx context.Context, items []*storag
 		entity.NewColumnInt64("expires_at", expiresAt),
 	}
 
-	// Insert data with retry
+	// Insert data with retry and metric tracking
+	insertStart := time.Now()
 	err = s.withRetry(ctx, func(ctx context.Context) error {
-		_, err := conn.Insert(ctx, s.collectionName, "", columns...)
+		_, err := conn.Insert(ctx, s.collection, "", columns...)
 		return err
 	})
 
 	if err != nil {
+		atomic.AddInt64(&s.metrics.failedInserts, 1)
 		return fmt.Errorf("failed to insert batch: %w", err)
 	}
 
-	// Cache the items
-	for _, item := range items {
-		s.localCache.Add(item.ID, item)
+	insertDuration := time.Since(insertStart)
+	atomic.AddInt64(&s.metrics.totalInsertTime, insertDuration.Nanoseconds())
+	atomic.AddInt64(&s.metrics.totalInserts, int64(len(items)))
+
+	// Verify a sample of items from the batch
+	verificationStart := time.Now()
+	sampleSize := min(5, len(items)) // Verify up to 5 random items
+	verifiedIDs := make(map[string]bool)
+
+	for i := 0; i < sampleSize; i++ {
+		idx := rand.Intn(len(items))
+		id := items[idx].ID
+		if verifiedIDs[id] {
+			continue // Skip if already verified
+		}
+		verifiedIDs[id] = true
+
+		if err := s.verifyItem(ctx, id, 3); err != nil {
+			s.logger.Error().
+				Err(err).
+				Str("item_id", id).
+				Dur("verification_time", time.Since(verificationStart)).
+				Msg("Batch verification failed")
+			return fmt.Errorf("batch verification failed: %w", err)
+		}
 	}
+
+	s.logger.Debug().
+		Int("verified_items", len(verifiedIDs)).
+		Dur("verification_time", time.Since(verificationStart)).
+		Msg("Batch verification completed")
+
+	// Update cache in background with rate limiting
+	go func() {
+		for _, item := range items {
+			select {
+			case <-time.After(time.Millisecond): // Rate limit cache updates
+				s.localCache.Add(item.ID, item)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	return nil
 }
@@ -715,24 +864,6 @@ func (s *MilvusStore) startBackgroundFlush(ctx context.Context) {
 			}
 		}
 	}()
-}
-
-func (s *MilvusStore) verifyItem(ctx context.Context, id string) error {
-	conn, err := s.getConnection()
-	if err != nil {
-		return fmt.Errorf("failed to get connection for verification: %w", err)
-	}
-	defer s.releaseConnection(conn)
-
-	expr := fmt.Sprintf("id == '%s'", id)
-	result, err := conn.Query(ctx, s.collection, []string{}, expr, []string{"id"})
-	if err != nil {
-		return fmt.Errorf("failed to verify item %s: %w", id, err)
-	}
-	if len(result) == 0 || len(result[0].(*entity.ColumnVarChar).Data()) == 0 {
-		return fmt.Errorf("item %s not found after insertion", id)
-	}
-	return nil
 }
 
 // GetByID retrieves an item by its ID
@@ -987,8 +1118,20 @@ func (s *MilvusStore) deleteChunk(ctx context.Context, ids []string) error {
 		cacheStart := time.Now()
 		for _, id := range ids {
 			s.localCache.Remove(id)
+			// Also remove any cached search results
+			s.localCache.Remove("search:" + id)
 		}
 		fmt.Printf("[Milvus:DeleteChunk] Cache cleanup completed in %v\n", time.Since(cacheStart))
+
+		// Clear the entire cache to ensure no stale search results remain
+		cacheStart = time.Now()
+		newCache, err := newShardedCache(s.poolSize * 100)
+		if err != nil {
+			s.logger.Error().Err(err).Msg("Failed to create new cache after deletion")
+		} else {
+			s.localCache = newCache
+			fmt.Printf("[Milvus:DeleteChunk] Cache cleared in %v\n", time.Since(cacheStart))
+		}
 
 		fmt.Printf("[Milvus:DeleteChunk] Total chunk operation took %v\n", time.Since(chunkStart))
 		return nil
@@ -1169,6 +1312,66 @@ func (s *MilvusStore) ensureCollection(ctx context.Context) error {
 	return nil
 }
 
+// searchParams holds optimized search parameters
+type searchParams struct {
+	nprobe       int
+	ef           int
+	metric       entity.MetricType
+	useParallel  bool
+	numPartition int
+}
+
+// getOptimizedSearchParams returns optimized search parameters based on dataset size
+func (s *MilvusStore) getOptimizedSearchParams(ctx context.Context) (*searchParams, error) {
+	conn, err := s.getConnection()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get connection: %w", err)
+	}
+	defer s.releaseConnection(conn)
+
+	// Get collection stats
+	stats, err := conn.GetCollectionStatistics(ctx, s.collection)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get collection stats: %w", err)
+	}
+
+	var rowCount int64
+	rowCountStr, ok := stats["row_count"]
+	if ok {
+		rowCount, _ = strconv.ParseInt(rowCountStr, 10, 64)
+	}
+
+	// Optimize parameters based on dataset size
+	params := &searchParams{
+		metric: entity.L2,
+	}
+
+	switch {
+	case rowCount < 10000: // Small dataset
+		params.nprobe = 8
+		params.ef = 64
+		params.useParallel = false
+		params.numPartition = 1
+	case rowCount < 100000: // Medium dataset
+		params.nprobe = 16
+		params.ef = 128
+		params.useParallel = true
+		params.numPartition = 2
+	case rowCount < 1000000: // Large dataset
+		params.nprobe = 32
+		params.ef = 256
+		params.useParallel = true
+		params.numPartition = 4
+	default: // Very large dataset
+		params.nprobe = 64
+		params.ef = 512
+		params.useParallel = true
+		params.numPartition = 8
+	}
+
+	return params, nil
+}
+
 // Search performs a similarity search using the provided vector
 func (s *MilvusStore) Search(ctx context.Context, vector []float32, limit int) ([]*storage.Item, error) {
 	start := time.Now()
@@ -1179,24 +1382,39 @@ func (s *MilvusStore) Search(ctx context.Context, vector []float32, limit int) (
 	if cached, ok := s.localCache.Get(cacheKey); ok {
 		if items, ok := cached.([]*storage.Item); ok {
 			fmt.Printf("[Milvus:Search] Cache hit, returning %d items\n", len(items))
+			atomic.AddInt64(&s.metrics.cacheHits, 1)
 			return items, nil
 		}
 	}
+	atomic.AddInt64(&s.metrics.cacheMisses, 1)
 
 	if len(vector) != s.dimension {
 		return nil, fmt.Errorf("invalid vector dimension: got %d, want %d", len(vector), s.dimension)
 	}
 
+	// Get optimized search parameters
+	params, err := s.getOptimizedSearchParams(ctx)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("Failed to get optimized search params, using defaults")
+		params = &searchParams{
+			nprobe:       16,
+			ef:           128,
+			metric:       entity.L2,
+			useParallel:  true,
+			numPartition: 2,
+		}
+	}
+
 	var searchResults []client.SearchResult
-	err := s.withRetry(ctx, func(ctx context.Context) error {
+	err = s.withRetry(ctx, func(ctx context.Context) error {
 		conn, err := s.getConnection()
 		if err != nil {
 			return fmt.Errorf("failed to get connection: %w", err)
 		}
 		defer s.releaseConnection(conn)
 
-		// Optimize search parameters for high dimensions
-		sp, err := entity.NewIndexIvfFlatSearchParam(16) // Increased nprobe for better recall
+		// Create optimized search parameters
+		sp, err := entity.NewIndexIvfFlatSearchParam(params.nprobe)
 		if err != nil {
 			return fmt.Errorf("failed to create search parameters: %w", err)
 		}
@@ -1213,14 +1431,16 @@ func (s *MilvusStore) Search(ctx context.Context, vector []float32, limit int) (
 		}
 
 		// Ensure collection is loaded
-		err = conn.LoadCollection(ctx, s.collection, false)
+		err = conn.LoadCollection(ctx, s.collection, params.useParallel)
 		if err != nil {
 			return fmt.Errorf("failed to load collection: %w", err)
 		}
 
-		// Perform search
+		// Perform search with optimized parameters
 		searchStart := time.Now()
-		fmt.Printf("[Milvus:Search] Executing search with dimension %d\n", len(vector))
+		fmt.Printf("[Milvus:Search] Executing search with dimension %d, nprobe %d\n",
+			len(vector), params.nprobe)
+
 		result, err := conn.Search(
 			ctx,
 			s.collection,
@@ -1229,7 +1449,7 @@ func (s *MilvusStore) Search(ctx context.Context, vector []float32, limit int) (
 			outputFields,
 			[]entity.Vector{entity.FloatVector(vector)},
 			"vector",
-			entity.L2,
+			params.metric,
 			limit,
 			sp,
 		)
@@ -1448,101 +1668,234 @@ func (s *MilvusStore) processLargeBatch(ctx context.Context, items []*storage.It
 	logger := s.logger.With().Int("total_items", totalItems).Logger()
 	logger.Debug().Msg("Starting large batch processing")
 
-	const optimalBatchSize = 2000
+	// Calculate optimal batch size based on vector dimension
+	optimalBatchSize := s.calculateOptimalBatchSize()
 	batches := (totalItems + optimalBatchSize - 1) / optimalBatchSize
 
+	// Create worker pool for parallel processing
+	pool := newVectorWorkerPool(maxConcurrentChunks)
+	pool.start()
+	defer pool.stop()
+
+	// Process batches in parallel
+	for i := 0; i < totalItems; i += optimalBatchSize {
+		end := i + optimalBatchSize
+		if end > totalItems {
+			end = totalItems
+		}
+		batch := items[i:end]
+		batchNum := (i / optimalBatchSize) + 1
+
+		// Submit batch processing task
+		pool.tasks <- func() error {
+			batchStart := time.Now()
+			batchLogger := logger.With().
+				Int("batch_number", batchNum).
+				Int("total_batches", batches).
+				Int("batch_size", len(batch)).
+				Logger()
+
+			// Process batch with optimized memory allocation
+			if err := s.processBatchOptimized(ctx, batch, batchLogger); err != nil {
+				batchLogger.Error().
+					Err(err).
+					Dur("duration", time.Since(batchStart)).
+					Msg("Batch processing failed")
+				return fmt.Errorf("batch %d failed: %v", batchNum, err)
+			}
+
+			batchLogger.Debug().
+				Dur("duration", time.Since(batchStart)).
+				Msg("Batch completed")
+			return nil
+		}
+	}
+
+	// Collect results
+	var errs []error
+	for i := 0; i < batches; i++ {
+		if err := <-pool.results; err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("batch processing errors: %v", errs)
+	}
+
+	logger.Debug().
+		Dur("duration", time.Since(start)).
+		Msg("Large batch processing completed")
+	return nil
+}
+
+// processBatchOptimized processes a batch with optimized memory allocation
+func (s *MilvusStore) processBatchOptimized(ctx context.Context, batch []*storage.Item, logger zerolog.Logger) error {
+	batchSize := len(batch)
+	if batchSize == 0 {
+		return nil
+	}
+
+	// Pre-allocate all slices with optimal size
+	ids := make([]string, 0, batchSize)
+	vectors := make([][]float32, 0, batchSize)
+	contentTypes := make([]string, 0, batchSize)
+	contentData := make([]string, 0, batchSize)
+	metadata := make([]string, 0, batchSize)
+	createdAt := make([]int64, 0, batchSize)
+	expiresAt := make([]int64, 0, batchSize)
+
+	// Get vector buffer from pool
+	vectorBuffer := s.vectorPool.get(s.dimension * batchSize)
+	defer s.vectorPool.put(vectorBuffer)
+
+	// Process items with minimal allocations
+	for _, item := range batch {
+		ids = append(ids, item.ID)
+
+		// Copy vector data to buffer
+		start := len(vectorBuffer)
+		vectorBuffer = append(vectorBuffer, item.Vector...)
+		vectors = append(vectors, vectorBuffer[start:len(vectorBuffer)])
+
+		contentTypes = append(contentTypes, string(item.Content.Type))
+		contentData = append(contentData, string(item.Content.Data))
+		metadata = append(metadata, encodeMetadata(item.Metadata))
+		createdAt = append(createdAt, item.CreatedAt.UnixNano())
+		expiresAt = append(expiresAt, item.ExpiresAt.UnixNano())
+	}
+
+	// Create columns efficiently
+	columns := []entity.Column{
+		entity.NewColumnVarChar("id", ids),
+		entity.NewColumnFloatVector("vector", s.dimension, vectors),
+		entity.NewColumnVarChar("content_type", contentTypes),
+		entity.NewColumnVarChar("content_data", contentData),
+		entity.NewColumnVarChar("metadata", metadata),
+		entity.NewColumnInt64("created_at", createdAt),
+		entity.NewColumnInt64("expires_at", expiresAt),
+	}
+
+	// Get connection from pool
 	conn, err := s.getConnection()
 	if err != nil {
 		return fmt.Errorf("failed to get connection: %w", err)
 	}
 	defer s.releaseConnection(conn)
 
-	// Process all items in batches
-	for i := 0; i < totalItems; i += optimalBatchSize {
-		batchStart := time.Now()
-		end := i + optimalBatchSize
-		if end > totalItems {
-			end = totalItems
-		}
-		batch := items[i:end]
-		batchSize := len(batch)
-		batchLogger := logger.With().
-			Int("batch_number", (i/optimalBatchSize)+1).
-			Int("total_batches", batches).
-			Int("batch_size", batchSize).
-			Logger()
+	// Insert data with retry and metric tracking
+	insertStart := time.Now()
+	logger.Debug().Msg("Starting batch insert")
 
-		batchLogger.Debug().Msg("Processing batch")
-
-		// Pre-allocate all slices for the batch
-		ids := make([]string, batchSize)
-		vectors := make([][]float32, batchSize)
-		contentTypes := make([]string, batchSize)
-		contentData := make([]string, batchSize)
-		metadata := make([]string, batchSize)
-		createdAt := make([]int64, batchSize)
-		expiresAt := make([]int64, batchSize)
-
-		// Process items
-		for j := range batch {
-			ids[j] = batch[j].ID
-			vectors[j] = batch[j].Vector
-			contentTypes[j] = string(batch[j].Content.Type)
-			contentData[j] = string(batch[j].Content.Data)
-			metadata[j] = encodeMetadata(batch[j].Metadata)
-			createdAt[j] = batch[j].CreatedAt.UnixNano()
-			expiresAt[j] = batch[j].ExpiresAt.UnixNano()
-		}
-
-		// Create columns
-		idCol := entity.NewColumnVarChar("id", ids)
-		vectorCol := entity.NewColumnFloatVector("vector", s.dimension, vectors)
-		contentTypeCol := entity.NewColumnVarChar("content_type", contentTypes)
-		contentDataCol := entity.NewColumnVarChar("content_data", contentData)
-		metadataCol := entity.NewColumnVarChar("metadata", metadata)
-		createdAtCol := entity.NewColumnInt64("created_at", createdAt)
-		expiresAtCol := entity.NewColumnInt64("expires_at", expiresAt)
-
-		// Insert data
-		insertStart := time.Now()
-		batchLogger.Debug().Msg("Starting batch insert")
-		_, err = conn.Insert(ctx, s.collection, "", idCol, vectorCol, contentTypeCol,
-			contentDataCol, metadataCol, createdAtCol, expiresAtCol)
+	err = s.withRetry(ctx, func(ctx context.Context) error {
+		_, err := conn.Insert(ctx, s.collection, "", columns...)
 		if err != nil {
-			batchLogger.Error().
-				Err(err).
-				Dur("duration", time.Since(insertStart)).
-				Msg("Batch insert failed")
 			return fmt.Errorf("failed to insert batch: %w", err)
 		}
-		batchLogger.Debug().
-			Dur("duration", time.Since(insertStart)).
-			Msg("Batch inserted")
 
-		batchLogger.Debug().
-			Dur("duration", time.Since(batchStart)).
-			Msg("Batch completed")
-	}
+		// Flush to ensure data is persisted
+		if err := conn.Flush(ctx, s.collection, false); err != nil {
+			return fmt.Errorf("failed to flush after insert: %w", err)
+		}
 
-	// Flush after all batches are inserted
-	flushStart := time.Now()
-	logger.Debug().Msg("Starting final flush")
-	if err := conn.Flush(ctx, s.collection, false); err != nil {
+		// Load collection to ensure data is indexed
+		if err := conn.LoadCollection(ctx, s.collection, false); err != nil {
+			return fmt.Errorf("failed to load collection after insert: %w", err)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		atomic.AddInt64(&s.metrics.failedInserts, 1)
 		logger.Error().
 			Err(err).
-			Dur("duration", time.Since(flushStart)).
-			Msg("Final flush failed")
-		return fmt.Errorf("failed to flush after insertion: %w", err)
+			Dur("duration", time.Since(insertStart)).
+			Msg("Batch insert failed")
+		return fmt.Errorf("failed to insert batch: %w", err)
 	}
-	logger.Debug().
-		Dur("duration", time.Since(flushStart)).
-		Msg("Final flush completed")
+
+	insertDuration := time.Since(insertStart)
+	atomic.AddInt64(&s.metrics.totalInsertTime, insertDuration.Nanoseconds())
+	atomic.AddInt64(&s.metrics.totalInserts, int64(len(batch)))
 
 	logger.Debug().
-		Dur("duration", time.Since(start)).
-		Msg("Large batch processing completed")
+		Dur("duration", insertDuration).
+		Msg("Batch inserted")
+
+	// Update cache in background with rate limiting
+	go func() {
+		for _, item := range batch {
+			select {
+			case <-time.After(time.Millisecond): // Rate limit cache updates
+				s.localCache.Add(item.ID, item)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	return nil
+}
+
+// calculateOptimalBatchSize determines the optimal batch size based on performance metrics
+func (s *MilvusStore) calculateOptimalBatchSize() int {
+	// Calculate memory per vector
+	memoryPerVector := s.dimension * 4 // 4 bytes per float32
+
+	// Get system memory info
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	// Calculate memory-based size
+	availableMemory := (m.Sys - m.HeapAlloc) / 10 // Use up to 10% of available memory
+	maxVectorsInMemory := availableMemory / uint64(memoryPerVector)
+
+	// Get performance metrics
+	totalInserts := atomic.LoadInt64(&s.metrics.totalInserts)
+	if totalInserts == 0 {
+		// No metrics yet, use memory-based calculation
+		if maxVectorsInMemory > uint64(batchSize) {
+			maxVectorsInMemory = uint64(batchSize)
+		}
+		if maxVectorsInMemory < 100 {
+			maxVectorsInMemory = 100
+		}
+		return int(maxVectorsInMemory)
+	}
+
+	// Calculate average insert time per item
+	totalTime := time.Duration(atomic.LoadInt64(&s.metrics.totalInsertTime))
+	avgTimePerItem := totalTime.Nanoseconds() / totalInserts
+
+	// Adjust batch size based on performance
+	failureRate := float64(atomic.LoadInt64(&s.metrics.failedInserts)) / float64(totalInserts)
+
+	var optimalSize int
+	switch {
+	case failureRate > 0.1: // High failure rate, reduce batch size
+		optimalSize = int(float64(s.batchSize) * 0.8)
+	case failureRate < 0.01 && avgTimePerItem < 1000000: // Low failure rate and good performance
+		optimalSize = int(float64(s.batchSize) * 1.2)
+	default:
+		optimalSize = s.batchSize
+	}
+
+	// Apply bounds
+	if optimalSize > int(maxVectorsInMemory) {
+		optimalSize = int(maxVectorsInMemory)
+	}
+	if optimalSize > batchSize {
+		optimalSize = batchSize
+	}
+	if optimalSize < 100 {
+		optimalSize = 100
+	}
+
+	// Update average batch size metric
+	s.metrics.avgBatchSize = float64(optimalSize)
+
+	return optimalSize
 }
 
 // newConnectionPool creates a new connection pool
@@ -1838,14 +2191,11 @@ func (s *MilvusStore) prefetchItems(ctx context.Context, ids []string) error {
 	return nil
 }
 
-// BatchSet processes a batch of items efficiently
+// BatchSet stores vectors with their associated data in batches
 func (s *MilvusStore) BatchSet(ctx context.Context, items []*storage.Item) error {
 	if len(items) == 0 {
 		return nil
 	}
-
-	fmt.Printf("[Milvus:BatchSet] Starting batch operation with %d items\n", len(items))
-	start := time.Now()
 
 	// Validate items before processing
 	for _, item := range items {
@@ -1877,7 +2227,6 @@ func (s *MilvusStore) BatchSet(ctx context.Context, items []*storage.Item) error
 		}
 	}
 
-	fmt.Printf("[Milvus:BatchSet] Completed batch operation in %v\n", time.Since(start))
 	return nil
 }
 
@@ -1893,6 +2242,10 @@ func (s *MilvusStore) processBatch(ctx context.Context, items []*storage.Item) e
 			return fmt.Errorf("failed to get connection: %w", err)
 		}
 		defer s.releaseConnection(conn)
+
+		// Get vector buffer from pool with appropriate size
+		vectorBuffer := s.vectorPool.get(s.dimension)
+		defer s.vectorPool.put(vectorBuffer)
 
 		// Prepare column data
 		ids := make([]string, len(items))
@@ -1914,42 +2267,30 @@ func (s *MilvusStore) processBatch(ctx context.Context, items []*storage.Item) e
 		}
 
 		// Create columns
-		idColumn := entity.NewColumnVarChar("id", ids)
-		vectorColumn := entity.NewColumnFloatVector("vector", s.dimension, vectors)
-		contentTypeColumn := entity.NewColumnVarChar("content_type", contentTypes)
-		contentDataColumn := entity.NewColumnVarChar("content_data", contentData)
-		metadataColumn := entity.NewColumnVarChar("metadata", metadata)
-		createdAtColumn := entity.NewColumnInt64("created_at", createdAt)
-		expiresAtColumn := entity.NewColumnInt64("expires_at", expiresAt)
+		columns := []entity.Column{
+			entity.NewColumnVarChar("id", ids),
+			entity.NewColumnFloatVector("vector", s.dimension, vectors),
+			entity.NewColumnVarChar("content_type", contentTypes),
+			entity.NewColumnVarChar("content_data", contentData),
+			entity.NewColumnVarChar("metadata", metadata),
+			entity.NewColumnInt64("created_at", createdAt),
+			entity.NewColumnInt64("expires_at", expiresAt),
+		}
 
 		// Insert data
-		_, err = conn.Insert(ctx, s.collection, "", idColumn, vectorColumn, contentTypeColumn,
-			contentDataColumn, metadataColumn, createdAtColumn, expiresAtColumn)
+		_, err = conn.Insert(ctx, s.collection, "", columns...)
 		if err != nil {
 			return fmt.Errorf("failed to insert data: %w", err)
 		}
 
-		// Flush to ensure data is persisted
-		err = conn.Flush(ctx, s.collection, false)
-		if err != nil {
-			return fmt.Errorf("failed to flush data: %w", err)
-		}
+		// Update metrics
+		atomic.AddInt64(&s.metrics.totalInserts, int64(len(items)))
+		atomic.AddInt64(&s.metrics.totalInsertTime, time.Since(time.Now()).Nanoseconds())
 
 		return nil
 	})
 
 	return err
-}
-
-// calculateOptimalBatchSize determines the optimal batch size based on vector dimension
-func (s *MilvusStore) calculateOptimalBatchSize() int {
-	// Base batch size on vector dimension and available memory
-	memoryPerVector := s.dimension * 4 // 4 bytes per float32
-	maxVectorsInMemory := maxBufferSize * 1024 * 1024 / memoryPerVector
-
-	// Ensure batch size is within reasonable limits
-	optimalSize := min(maxVectorsInMemory, batchSize)
-	return max(optimalSize, 100) // Minimum batch size of 100
 }
 
 // Helper functions
@@ -2172,38 +2513,39 @@ func (s *MilvusStore) logPoolMetrics() {
 	}
 }
 
-// Add new worker pool for vector operations
+// vectorWorkerPool manages parallel vector processing
 type vectorWorkerPool struct {
 	workers int
 	tasks   chan func() error
 	results chan error
-	done    chan struct{}
+	wg      sync.WaitGroup
 }
 
 func newVectorWorkerPool(workers int) *vectorWorkerPool {
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
 	return &vectorWorkerPool{
 		workers: workers,
 		tasks:   make(chan func() error, workers*2),
 		results: make(chan error, workers*2),
-		done:    make(chan struct{}),
 	}
 }
 
 func (p *vectorWorkerPool) start() {
+	p.wg.Add(p.workers)
 	for i := 0; i < p.workers; i++ {
 		go func() {
-			for {
-				select {
-				case task := <-p.tasks:
-					p.results <- task()
-				case <-p.done:
-					return
-				}
+			defer p.wg.Done()
+			for task := range p.tasks {
+				p.results <- task()
 			}
 		}()
 	}
 }
 
 func (p *vectorWorkerPool) stop() {
-	close(p.done)
+	close(p.tasks)
+	p.wg.Wait()
+	close(p.results)
 }
