@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/objones25/athena/internal/embeddings"
-	"github.com/objones25/athena/internal/embeddings/similarity"
+	"github.com/objones25/athena/internal/search/similarity"
 )
 
 // cosineSimilarity calculates the cosine similarity between two vectors

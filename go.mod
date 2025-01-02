@@ -13,6 +13,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/yalue/onnxruntime_go v1.14.0
 	golang.org/x/sync v0.10.0
+	gonum.org/v1/gonum v0.7.0
 )
 
 require (
@@ -50,7 +51,6 @@ require (
 	golang.org/x/net v0.26.0 // indirect
 	golang.org/x/sys v0.28.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
-	gonum.org/v1/gonum v0.7.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240314234333-6e1732d8331c // indirect
 	google.golang.org/grpc v1.62.1 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
@@ -59,3 +59,4 @@ require (
 )
 
 replace github.com/yalue/onnxruntime_go => github.com/yalue/onnxruntime_go v1.14.0
+
