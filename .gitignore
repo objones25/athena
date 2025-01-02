@@ -39,3 +39,14 @@
 .cache/
 
 /volumes/
+
+/models/
+
+/onnxruntime-osx-arm64-1.14.0/
+
+/onnxruntime-linux-arm64-1.14.0/
+
+/onnxruntime-linux-x64-1.14.0/
+
+/onnxruntime-osx-x64-1.14.0/
+

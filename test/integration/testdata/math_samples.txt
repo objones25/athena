@@ -1,0 +1,10 @@
+1 + 1 = 2
+2x + 3y = 10
+∫(x²)dx = (x³)/3 + C
+lim(x→∞) 1/x = 0
+f(x) = sin(x) + cos(x)
+E = mc²
+a² + b² = c²
+∑(n=1 to ∞) 1/n²
+det|A| = |a₁₁a₂₂ - a₁₂a₂₁|
+dx/dt = v(t) 

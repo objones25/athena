@@ -1,0 +1,6 @@
+This is a test sentence for embedding generation.
+The quick brown fox jumps over the lazy dog.
+I love programming in Go.
+Python is a popular programming language.
+The weather is nice today.
+This is a longer piece of text that contains multiple sentences. It should be split into sentences by the model. Each sentence will be embedded separately and then combined. The final embedding should capture the semantic meaning of the entire text. 
