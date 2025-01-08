@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"math/rand"
+	"os"
 	"runtime"
 	"sort"
 	"strconv"
@@ -15,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"container/heap"
 
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/milvus-io/milvus-sdk-go/v2/client"
@@ -33,6 +37,8 @@ type Config struct {
 	BatchSize      int
 	MaxRetries     int
 	PoolSize       int
+	Quantization   QuantizationConfig
+	Graph          GraphConfig
 }
 
 const (
@@ -175,6 +181,15 @@ func (sc *ShardedCache) Remove(key string) {
 	sc.getShard(key).Remove(key)
 }
 
+// Add batch metrics type definition
+type batchMetrics struct {
+	processingTime atomic.Int64
+	batchSize      atomic.Int64
+	successCount   atomic.Int64
+	failureCount   atomic.Int64
+	totalLatency   atomic.Int64
+}
+
 // MilvusStore implements the storage.Store interface using Milvus as the backend.
 type MilvusStore struct {
 	collectionName string
@@ -213,7 +228,26 @@ type MilvusStore struct {
 		// Track relationships between items
 		relationships map[string][]string
 	}
-	vectorPool *vectorBufferPool
+	vectorPool  *vectorBufferPool
+	quantizer   *Quantizer
+	graph       *SimilarityGraph
+	vectorStore *LockFreeVectorStore
+	simdProc    *SimdProcessor
+	batchProc   *BatchProcessor
+	// Add batch sizing metrics
+	batchMetrics     batchMetrics
+	lshIndex         *LSHIndex
+	hybridSearch     *HybridSearch
+	indexUpdater     *ConcurrentIndexUpdater
+	optimisticSearch *OptimisticSearch
+	adaptiveIndex    *AdaptiveIndex
+	indexStats       struct {
+		sync.RWMutex
+		searchLatency   []time.Duration
+		searchHitRate   float64
+		totalSearches   int64
+		successSearches int64
+	}
 }
 
 // AccessPattern tracks item access history
@@ -249,57 +283,90 @@ type pooledConnection struct {
 
 // vectorBufferPool manages pre-allocated vector buffers with size classes
 type vectorBufferPool struct {
-	sync.Mutex
-	buffers    map[int][][]float32
-	dimension  int
-	maxBuffers int
+	pools     []sync.Pool
+	sizes     []int
+	dimension int
 }
 
-func newVectorBufferPool(dimension, maxBuffers int) *vectorBufferPool {
+// Update newVectorBufferPool
+func newVectorBufferPool(dimension int) *vectorBufferPool {
+	// Reduce size classes and make them more targeted
+	sizes := []int{32, 128, 512, 2048} // Reduced from 7 to 4 size classes
+	pools := make([]sync.Pool, len(sizes))
+
+	for i, size := range sizes {
+		size := size // Capture for closure
+		pools[i] = sync.Pool{
+			New: func() interface{} {
+				return make([]float32, 0, size*dimension)
+			},
+		}
+	}
+
 	return &vectorBufferPool{
-		buffers:    make(map[int][][]float32),
-		dimension:  dimension,
-		maxBuffers: maxBuffers,
+		pools:     pools,
+		sizes:     sizes,
+		dimension: dimension,
 	}
 }
 
+// Update get method
 func (p *vectorBufferPool) get(size int) []float32 {
-	p.Lock()
-	defer p.Unlock()
-
-	// Round up to nearest power of 2 for better memory utilization
-	size = nextPowerOfTwo(size)
-
-	if buffers, ok := p.buffers[size]; ok && len(buffers) > 0 {
-		buffer := buffers[len(buffers)-1]
-		p.buffers[size] = buffers[:len(buffers)-1]
-		return buffer[:0] // Reset length but keep capacity
+	// Find the appropriate size class
+	poolIndex := p.findSizeClass(size)
+	if poolIndex >= 0 {
+		buf := p.pools[poolIndex].Get().([]float32)
+		return buf[:0] // Reset length but keep capacity
 	}
 
+	// If no suitable pool found, allocate new buffer
 	return make([]float32, 0, size)
 }
 
-func (p *vectorBufferPool) put(buffer []float32) {
-	p.Lock()
-	defer p.Unlock()
+// Update put method
+func (p *vectorBufferPool) put(buf []float32) {
+	if cap(buf) == 0 {
+		return
+	}
 
-	size := nextPowerOfTwo(cap(buffer))
-	if len(p.buffers[size]) < p.maxBuffers {
-		p.buffers[size] = append(p.buffers[size], buffer)
+	// Find the appropriate size class
+	poolIndex := p.findSizeClass(cap(buf))
+	if poolIndex >= 0 {
+		p.pools[poolIndex].Put(buf)
 	}
 }
 
-// nextPowerOfTwo returns the next power of 2 >= n
-func nextPowerOfTwo(n int) int {
-	n--
-	n |= n >> 1
-	n |= n >> 2
-	n |= n >> 4
-	n |= n >> 8
-	n |= n >> 16
-	n |= n >> 32
-	n++
-	return n
+// Add findSizeClass method
+func (p *vectorBufferPool) findSizeClass(size int) int {
+	// Find the smallest size class that can accommodate the requested size
+	for i, s := range p.sizes {
+		if s*p.dimension >= size {
+			return i
+		}
+	}
+	return -1
+}
+
+// Update preallocate method to reduce initial allocations
+func (p *vectorBufferPool) preallocate() {
+	for i, size := range p.sizes {
+		// Reduce pre-allocations from 4 to 2 per size class
+		for j := 0; j < 2; j++ {
+			p.pools[i].Put(make([]float32, 0, size*p.dimension))
+		}
+	}
+}
+
+// Add method to clear unused buffers
+func (p *vectorBufferPool) clearUnused() {
+	// Clear out any buffers that haven't been used recently
+	for i := range p.pools {
+		for {
+			if buf := p.pools[i].Get(); buf == nil {
+				break
+			}
+		}
+	}
 }
 
 // NewMilvusStore creates a new Milvus store instance with the provided configuration.
@@ -335,6 +402,57 @@ func NewMilvusStore(cfg Config) (*MilvusStore, error) {
 	}
 	fmt.Printf("[Milvus:Init] Connection pool created in %v\n", time.Since(poolStart))
 
+	// Initialize quantizer
+	quantizer := NewQuantizer(cfg.Quantization, cfg.Dimension)
+
+	// Initialize similarity graph
+	graph := NewSimilarityGraph(cfg.Graph, cfg.Dimension)
+
+	// Initialize optimized components
+	vectorStore := NewLockFreeVectorStore(cfg.Dimension, 10000)
+	simdProc := NewSimdProcessor(runtime.NumCPU())
+	batchProc := NewBatchProcessor(runtime.NumCPU())
+
+	// Initialize and preallocate vector pool
+	vectorPool := newVectorBufferPool(cfg.Dimension)
+	vectorPool.preallocate()
+
+	// Initialize LSH index
+	lshConfig := DefaultLSHConfig()
+	lshIndex := NewLSHIndex(lshConfig, cfg.Dimension)
+
+	// Initialize hybrid search
+	hybridConfig := HybridSearchConfig{
+		LSHTables:          cfg.Graph.BatchSize,
+		LSHFunctions:       4,
+		LSHThreshold:       similarityThreshold,
+		HNSWMaxNeighbors:   cfg.Graph.MaxNeighbors,
+		HNSWMaxSearchDepth: cfg.Graph.MaxSearchDepth,
+		NumWorkers:         cfg.PoolSize,
+		BatchSize:          cfg.BatchSize,
+		SearchTimeout:      defaultTimeout,
+		QualityThreshold:   similarityThreshold,
+	}
+
+	hybridSearch, err := NewHybridSearch(hybridConfig, cfg.Dimension)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize hybrid search: %w", err)
+	}
+
+	// Initialize concurrent index updater
+	indexUpdater := NewConcurrentIndexUpdater(cfg.Dimension)
+
+	// Initialize optimistic search
+	optimisticSearch := NewOptimisticSearch(cfg.Dimension)
+
+	// Initialize adaptive index
+	adaptiveConfig := &AdaptiveConfig{
+		DatasetSizeThreshold: 1000000, // 1M items
+		LatencyThreshold:     100 * time.Millisecond,
+		MemoryThreshold:      1 << 30, // 1GB
+	}
+	adaptiveIndex := NewAdaptiveIndex(adaptiveConfig)
+
 	store := &MilvusStore{
 		collectionName: cfg.CollectionName,
 		dimension:      cfg.Dimension,
@@ -356,8 +474,27 @@ func NewMilvusStore(cfg Config) (*MilvusStore, error) {
 			items:     make([]*storage.Item, 0, maxBufferSize),
 			lastFlush: time.Now(),
 		},
-		localCache: localCache,
-		vectorPool: newVectorBufferPool(cfg.Dimension, 1000),
+		localCache:       localCache,
+		vectorPool:       vectorPool,
+		quantizer:        quantizer,
+		graph:            graph,
+		vectorStore:      vectorStore,
+		simdProc:         simdProc,
+		batchProc:        batchProc,
+		lshIndex:         lshIndex,
+		hybridSearch:     hybridSearch,
+		indexUpdater:     indexUpdater,
+		optimisticSearch: optimisticSearch,
+		adaptiveIndex:    adaptiveIndex,
+		indexStats: struct {
+			sync.RWMutex
+			searchLatency   []time.Duration
+			searchHitRate   float64
+			totalSearches   int64
+			successSearches int64
+		}{
+			searchLatency: make([]time.Duration, 0, 1000),
+		},
 	}
 
 	// Initialize access patterns tracking
@@ -400,6 +537,10 @@ func NewMilvusStore(cfg Config) (*MilvusStore, error) {
 	}
 
 	fmt.Printf("[Milvus:Init] Total initialization completed in %v\n", time.Since(start))
+
+	// Start index performance monitoring
+	go store.monitorIndexPerformance()
+
 	return store, nil
 }
 
@@ -1107,7 +1248,7 @@ func (s *MilvusStore) deleteChunk(ctx context.Context, ids []string) error {
 					remainingIds := idCol.Data()
 					fmt.Printf("[Milvus:DeleteChunk] WARNING: Found %d items still present after deletion: %v\n",
 						len(remainingIds), remainingIds)
-					return fmt.Errorf("deletion verification failed: items still present after %d retries", maxVerifyRetries, maxVerifyRetries)
+					return fmt.Errorf("deletion verification failed: items still present after %d retries", maxVerifyRetries)
 				}
 			}
 			time.Sleep(100 * time.Millisecond)
@@ -1312,17 +1453,26 @@ func (s *MilvusStore) ensureCollection(ctx context.Context) error {
 	return nil
 }
 
-// searchParams holds optimized search parameters
+// searchParams holds optimized search parameters that are dynamically adjusted
+// based on the dataset size and search performance metrics.
 type searchParams struct {
-	nprobe       int
-	ef           int
-	metric       entity.MetricType
-	useParallel  bool
+	// nprobe is the number of clusters to search in the index
+	nprobe int
+	// ef is the size of the dynamic candidate list for search
+	ef int
+	// metric defines the distance metric used for similarity calculation
+	metric entity.MetricType
+	// useParallel indicates whether to use parallel processing
+	useParallel bool
+	// numPartition defines how many partitions to use for parallel search
 	numPartition int
 }
 
 // getOptimizedSearchParams returns optimized search parameters based on dataset size
+// and current system metrics. It adapts the parameters to maintain optimal
+// performance as the dataset grows or changes.
 func (s *MilvusStore) getOptimizedSearchParams(ctx context.Context) (*searchParams, error) {
+	// Get connection from pool
 	conn, err := s.getConnection()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
@@ -1372,104 +1522,275 @@ func (s *MilvusStore) getOptimizedSearchParams(ctx context.Context) (*searchPara
 	return params, nil
 }
 
-// Search performs a similarity search using the provided vector
+// searchResult represents a single search result with its distance from the query vector.
+// This struct is used internally by the search implementation to track and sort results.
+type searchResult struct {
+	item     *storage.Item
+	distance float32
+}
+
+// resultHeap implements a min-heap of search results for efficient top-k retrieval
+type resultHeap struct {
+	results []searchResult
+	limit   int
+}
+
+func (h *resultHeap) init(limit int) {
+	h.limit = limit
+	h.results = make([]searchResult, 0, limit)
+	heap.Init(h)
+}
+
+func (h *resultHeap) Len() int {
+	return len(h.results)
+}
+
+func (h *resultHeap) Less(i, j int) bool {
+	// Max heap - larger distances at the root
+	return h.results[i].distance > h.results[j].distance
+}
+
+func (h *resultHeap) Swap(i, j int) {
+	h.results[i], h.results[j] = h.results[j], h.results[i]
+}
+
+func (h *resultHeap) Push(x interface{}) {
+	h.results = append(h.results, x.(searchResult))
+}
+
+func (h *resultHeap) Pop() interface{} {
+	old := h.results
+	n := len(old)
+	x := old[n-1]
+	h.results = old[0 : n-1]
+	return x
+}
+
+func (h *resultHeap) worst() searchResult {
+	if h.Len() == 0 {
+		return searchResult{distance: math.MaxFloat32}
+	}
+	return h.results[0]
+}
+
+func (h *resultHeap) replace(result searchResult) {
+	if result.distance < h.results[0].distance {
+		h.results[0] = result
+		heap.Fix(h, 0)
+	}
+}
+
+// Add parallel search implementation
+func (s *MilvusStore) parallelSearch(ctx context.Context, vector []float32, limit int) ([]*storage.Item, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Split search space into segments for parallel processing
+	nodes := s.graph.GetNodes()
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+
+	segmentSize := (len(nodes) + runtime.NumCPU() - 1) / runtime.NumCPU()
+	segments := make([][]float32, 0, runtime.NumCPU())
+
+	// Create segments of vectors
+	vectorBuffer := s.getVectorBuffer(len(nodes))
+	defer s.putVectorBuffer(vectorBuffer)
+
+	offset := 0
+	for i := 0; i < len(nodes); i += segmentSize {
+		end := i + segmentSize
+		if end > len(nodes) {
+			end = len(nodes)
+		}
+
+		// Copy vectors to buffer
+		segStart := offset
+		for _, node := range nodes[i:end] {
+			copy(vectorBuffer[offset:], node.Vector)
+			offset += len(node.Vector)
+		}
+		segments = append(segments, vectorBuffer[segStart:offset])
+	}
+
+	// Channel for collecting results with buffer to prevent blocking
+	results := make(chan searchResult, limit*2)
+	done := make(chan struct{})
+
+	// Start parallel search
+	var wg sync.WaitGroup
+	for i, segment := range segments {
+		wg.Add(1)
+		go func(segmentID int, segmentVectors []float32) {
+			defer wg.Done()
+
+			// Process segment
+			distances := s.simdProc.ComputeDistances(vector, [][]float32{segmentVectors})
+
+			// Send results through channel
+			for j, dist := range distances {
+				select {
+				case <-done:
+					return // Early stopping
+				case results <- searchResult{
+					item:     &storage.Item{Vector: segmentVectors[j*s.dimension : (j+1)*s.dimension]},
+					distance: dist,
+				}:
+				}
+			}
+		}(i, segment)
+	}
+
+	// Start result collector
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect and merge results with early stopping
+	resultHeap := &resultHeap{}
+	resultHeap.init(limit)
+
+	count := 0
+	for searchResult := range results {
+		if count < limit {
+			heap.Push(resultHeap, searchResult)
+			count++
+			continue
+		}
+
+		// Check if this result is better than our worst result
+		worst := resultHeap.worst()
+		if searchResult.distance < worst.distance {
+			resultHeap.replace(searchResult)
+
+			// If we have enough good results, stop other goroutines
+			if count >= limit*2 {
+				close(done)
+				break
+			}
+		}
+		count++
+	}
+
+	// Convert heap to sorted slice
+	items := make([]*storage.Item, 0, resultHeap.Len())
+	for resultHeap.Len() > 0 {
+		result := heap.Pop(resultHeap).(searchResult)
+		items = append(items, result.item)
+	}
+
+	// Reverse slice to get ascending order
+	for i := 0; i < len(items)/2; i++ {
+		j := len(items) - i - 1
+		items[i], items[j] = items[j], items[i]
+	}
+
+	return items, nil
+}
+
+// Search performs vector similarity search using adaptive index selection
 func (s *MilvusStore) Search(ctx context.Context, vector []float32, limit int) ([]*storage.Item, error) {
 	start := time.Now()
-	fmt.Printf("[Milvus:Search] Starting search with vector dimension %d, limit %d\n", len(vector), limit)
+	s.logger.Debug().
+		Int("dimension", len(vector)).
+		Int("limit", limit).
+		Msg("Starting search")
+
+	// Validate vector dimension
+	if len(vector) != s.dimension {
+		return nil, fmt.Errorf("invalid vector dimension: got %d, want %d", len(vector), s.dimension)
+	}
 
 	// Check cache first
 	cacheKey := s.vectorCacheKey(vector)
 	if cached, ok := s.localCache.Get(cacheKey); ok {
 		if items, ok := cached.([]*storage.Item); ok {
-			fmt.Printf("[Milvus:Search] Cache hit, returning %d items\n", len(items))
+			s.logger.Debug().Int("items", len(items)).Msg("Cache hit")
 			atomic.AddInt64(&s.metrics.cacheHits, 1)
 			return items, nil
 		}
 	}
 	atomic.AddInt64(&s.metrics.cacheMisses, 1)
 
-	if len(vector) != s.dimension {
-		return nil, fmt.Errorf("invalid vector dimension: got %d, want %d", len(vector), s.dimension)
-	}
+	// Get best index type based on current stats
+	datasetSize := s.getDatasetSize(ctx)
+	indexType := s.adaptiveIndex.SelectBestIndex(ctx, datasetSize)
+	var items []*storage.Item
+	var err error
 
-	// Get optimized search parameters
-	params, err := s.getOptimizedSearchParams(ctx)
-	if err != nil {
-		s.logger.Warn().Err(err).Msg("Failed to get optimized search params, using defaults")
-		params = &searchParams{
-			nprobe:       16,
-			ef:           128,
-			metric:       entity.L2,
-			useParallel:  true,
-			numPartition: 2,
+	switch indexType {
+	case IndexTypeLSH:
+		// Use LSH for fast approximate search
+		items, err = s.lshSearch(ctx, vector, limit)
+	case IndexTypeQuantization:
+		// Use quantization for memory-efficient search
+		items, err = s.quantizationSearch(ctx, vector, limit)
+	case IndexTypeHNSW:
+		// Use HNSW for accurate search
+		candidateIDs := s.optimisticSearch.Search(vector, limit)
+		items = make([]*storage.Item, 0, len(candidateIDs))
+		for _, id := range candidateIDs {
+			item, err := s.getItemByID(ctx, id)
+			if err != nil {
+				s.logger.Warn().
+					Err(err).
+					Str("item_id", id).
+					Msg("Failed to get item data")
+				continue
+			}
+			if item != nil {
+				items = append(items, item)
+			}
+		}
+	default:
+		// Fall back to hybrid search
+		results, searchErr := s.hybridSearch.Search(ctx, vector, limit)
+		if searchErr != nil {
+			s.logger.Error().Err(searchErr).Msg("Hybrid search failed")
+			return s.standardSearch(ctx, vector, limit)
+		}
+		items = make([]*storage.Item, 0, len(results))
+		for _, result := range results {
+			item, err := s.getItemByID(ctx, result.ID)
+			if err != nil {
+				s.logger.Warn().
+					Err(err).
+					Str("item_id", result.ID).
+					Msg("Failed to get item data")
+				continue
+			}
+			if item != nil {
+				items = append(items, item)
+			}
 		}
 	}
 
-	var searchResults []client.SearchResult
-	err = s.withRetry(ctx, func(ctx context.Context) error {
-		conn, err := s.getConnection()
-		if err != nil {
-			return fmt.Errorf("failed to get connection: %w", err)
-		}
-		defer s.releaseConnection(conn)
-
-		// Create optimized search parameters
-		sp, err := entity.NewIndexIvfFlatSearchParam(params.nprobe)
-		if err != nil {
-			return fmt.Errorf("failed to create search parameters: %w", err)
-		}
-
-		// Define output fields
-		outputFields := []string{
-			"id",
-			"vector",
-			"content_type",
-			"content_data",
-			"metadata",
-			"created_at",
-			"expires_at",
-		}
-
-		// Ensure collection is loaded
-		err = conn.LoadCollection(ctx, s.collection, params.useParallel)
-		if err != nil {
-			return fmt.Errorf("failed to load collection: %w", err)
-		}
-
-		// Perform search with optimized parameters
-		searchStart := time.Now()
-		fmt.Printf("[Milvus:Search] Executing search with dimension %d, nprobe %d\n",
-			len(vector), params.nprobe)
-
-		result, err := conn.Search(
-			ctx,
-			s.collection,
-			[]string{},
-			"",
-			outputFields,
-			[]entity.Vector{entity.FloatVector(vector)},
-			"vector",
-			params.metric,
-			limit,
-			sp,
-		)
-		if err != nil {
-			return fmt.Errorf("search operation failed: %w", err)
-		}
-		fmt.Printf("[Milvus:Search] Search completed in %v\n", time.Since(searchStart))
-
-		searchResults = result
-		return nil
-	})
+	// Update search stats
+	duration := time.Since(start)
+	s.indexStats.Lock()
+	s.indexStats.searchLatency = append(s.indexStats.searchLatency, duration)
+	s.indexStats.totalSearches++
+	if err == nil && len(items) > 0 {
+		s.indexStats.successSearches++
+	}
+	s.indexStats.Unlock()
 
 	if err != nil {
+		s.logger.Error().Err(err).Msg("Search failed")
 		return nil, err
 	}
 
-	// Process results
-	items, err := s.processSearchResults(searchResults)
-	if err != nil {
-		return nil, fmt.Errorf("failed to process search results: %w", err)
+	// Add index type to metadata
+	for _, item := range items {
+		if item.Metadata == nil {
+			item.Metadata = make(map[string]interface{})
+		}
+		item.Metadata["index_type"] = indexType.String()
 	}
 
 	// Cache results
@@ -1477,9 +1798,144 @@ func (s *MilvusStore) Search(ctx context.Context, vector []float32, limit int) (
 		s.localCache.Add(cacheKey, items)
 	}
 
-	fmt.Printf("[Milvus:Search] Search completed in %v, found %d items\n",
-		time.Since(start), len(items))
+	s.logger.Debug().
+		Dur("duration", duration).
+		Int("results", len(items)).
+		Str("index_type", indexType.String()).
+		Msg("Search completed")
 	return items, nil
+}
+
+// standardSearch is the fallback search method using Milvus directly
+func (s *MilvusStore) standardSearch(ctx context.Context, vector []float32, limit int) ([]*storage.Item, error) {
+	start := time.Now()
+	// Get optimized search parameters
+	params, err := s.getOptimizedSearchParams(ctx)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("Failed to get optimized parameters, using defaults")
+		params = &searchParams{
+			nprobe:       16,
+			ef:           64,
+			metric:       entity.L2,
+			useParallel:  true,
+			numPartition: runtime.NumCPU(),
+		}
+	}
+
+	// Check cache first
+	cacheKey := s.vectorCacheKey(vector)
+	if cached, ok := s.localCache.Get(cacheKey); ok {
+		if items, ok := cached.([]*storage.Item); ok {
+			s.logger.Debug().Int("items", len(items)).Msg("Cache hit")
+			atomic.AddInt64(&s.metrics.cacheHits, 1)
+			return items, nil
+		}
+	}
+	atomic.AddInt64(&s.metrics.cacheMisses, 1)
+
+	// Get initial candidates using LSH
+	candidates := s.lshIndex.Query(vector, limit*2) // Get 2x candidates for better recall
+
+	// Convert LSH results to storage.Items
+	items := make([]*storage.Item, 0, len(candidates))
+	for _, candidate := range candidates {
+		item, err := s.getItemByID(ctx, candidate.id)
+		if err != nil {
+			s.logger.Warn().
+				Err(err).
+				Str("item_id", candidate.id).
+				Msg("Failed to get item data")
+			continue
+		}
+		if item != nil {
+			items = append(items, item)
+		}
+	}
+
+	// If we don't have enough results from LSH, use parallel search
+	if len(items) < limit && params.useParallel {
+		parallelResults, err := s.parallelSearch(ctx, vector, limit-len(items))
+		if err != nil {
+			s.logger.Warn().Err(err).Msg("Parallel search failed")
+		} else {
+			items = append(items, parallelResults...)
+		}
+	}
+
+	// Refine results using exact distance computation
+	if len(items) > 0 {
+		// Use SIMD for parallel distance computation
+		distances := s.simdProc.ComputeDistances(vector, vectorsFromItems(items))
+
+		// Create result pairs for sorting
+		results := make([]searchResult, len(items))
+		for i := range items {
+			results[i] = searchResult{
+				item:     items[i],
+				distance: distances[i],
+			}
+		}
+
+		// Sort by distance
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].distance < results[j].distance
+		})
+
+		// Keep only top k
+		if len(results) > limit {
+			results = results[:limit]
+		}
+
+		// Extract items
+		items = make([]*storage.Item, len(results))
+		for i, r := range results {
+			items[i] = r.item
+		}
+	}
+
+	// Cache results
+	if len(items) > 0 {
+		s.localCache.Add(cacheKey, items)
+	}
+
+	s.logger.Debug().
+		Dur("duration", time.Since(start)).
+		Int("results", len(items)).
+		Msg("Standard search completed")
+	return nil, nil
+}
+
+// Add helper function to extract vectors from items
+func vectorsFromItems(items []*storage.Item) [][]float32 {
+	vectors := make([][]float32, len(items))
+	for i, item := range items {
+		vectors[i] = item.Vector
+	}
+	return vectors
+}
+
+// Add helper function to get item by ID
+func (s *MilvusStore) getItemByID(ctx context.Context, id string) (*storage.Item, error) {
+	// First check cache
+	if cached, ok := s.localCache.Get(id); ok {
+		if item, ok := cached.(*storage.Item); ok {
+			return item, nil
+		}
+	}
+
+	// Query Milvus for the item
+	expr := fmt.Sprintf("id == '%s'", id)
+	items, err := s.queryItems(ctx, expr, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	// Cache the result
+	s.localCache.Add(id, items[0])
+	return items[0], nil
 }
 
 // vectorCacheKey generates a cache key for vector search results
@@ -1626,6 +2082,18 @@ func (s *MilvusStore) processQueryResult(queryResult []entity.Column) (*storage.
 
 // Close properly shuts down all storage connections
 func (s *MilvusStore) Close() error {
+	if s.simdProc != nil {
+		s.simdProc.Close()
+	}
+	if s.graph != nil {
+		s.graph.Close()
+	}
+	if s.quantizer != nil {
+		s.quantizer.Close()
+	}
+	if s.optimisticSearch != nil {
+		s.optimisticSearch.Close()
+	}
 	// Close work queue first
 	s.workQueue.Close()
 
@@ -1731,110 +2199,108 @@ func (s *MilvusStore) processLargeBatch(ctx context.Context, items []*storage.It
 
 // processBatchOptimized processes a batch with optimized memory allocation
 func (s *MilvusStore) processBatchOptimized(ctx context.Context, batch []*storage.Item, logger zerolog.Logger) error {
+	start := time.Now()
 	batchSize := len(batch)
 	if batchSize == 0 {
 		return nil
 	}
 
-	// Pre-allocate all slices with optimal size
-	ids := make([]string, 0, batchSize)
-	vectors := make([][]float32, 0, batchSize)
-	contentTypes := make([]string, 0, batchSize)
-	contentData := make([]string, 0, batchSize)
-	metadata := make([]string, 0, batchSize)
-	createdAt := make([]int64, 0, batchSize)
-	expiresAt := make([]int64, 0, batchSize)
+	// Get optimal batch size
+	optimalSize := s.getOptimalBatchSize()
+
+	// Split into optimal sized batches
+	for i := 0; i < len(batch); i += optimalSize {
+		end := i + optimalSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+
+		if err := s.processBatchWithMetrics(ctx, batch[i:end], logger); err != nil {
+			return err
+		}
+	}
+
+	// Update metrics
+	s.batchMetrics.totalLatency.Add(time.Since(start).Nanoseconds())
+	s.batchMetrics.successCount.Add(1)
+	s.batchMetrics.batchSize.Store(int64(optimalSize))
+
+	return nil
+}
+
+// Add batch processing with metrics
+func (s *MilvusStore) processBatchWithMetrics(ctx context.Context, batch []*storage.Item, logger zerolog.Logger) error {
+	logger.Debug().Int("batch_size", len(batch)).Msg("Processing batch")
+	start := time.Now()
+
+	// Check context cancellation
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 
 	// Get vector buffer from pool
-	vectorBuffer := s.vectorPool.get(s.dimension * batchSize)
-	defer s.vectorPool.put(vectorBuffer)
+	vectorBuffer := s.getVectorBuffer(len(batch))
+	defer s.putVectorBuffer(vectorBuffer)
 
-	// Process items with minimal allocations
+	// Process vectors in parallel using batch processor
+	vectors := make([][]float32, 0, len(batch))
+
+	// Efficiently copy vectors to buffer
+	offset := 0
 	for _, item := range batch {
-		ids = append(ids, item.ID)
-
-		// Copy vector data to buffer
-		start := len(vectorBuffer)
-		vectorBuffer = append(vectorBuffer, item.Vector...)
-		vectors = append(vectors, vectorBuffer[start:len(vectorBuffer)])
-
-		contentTypes = append(contentTypes, string(item.Content.Type))
-		contentData = append(contentData, string(item.Content.Data))
-		metadata = append(metadata, encodeMetadata(item.Metadata))
-		createdAt = append(createdAt, item.CreatedAt.UnixNano())
-		expiresAt = append(expiresAt, item.ExpiresAt.UnixNano())
-	}
-
-	// Create columns efficiently
-	columns := []entity.Column{
-		entity.NewColumnVarChar("id", ids),
-		entity.NewColumnFloatVector("vector", s.dimension, vectors),
-		entity.NewColumnVarChar("content_type", contentTypes),
-		entity.NewColumnVarChar("content_data", contentData),
-		entity.NewColumnVarChar("metadata", metadata),
-		entity.NewColumnInt64("created_at", createdAt),
-		entity.NewColumnInt64("expires_at", expiresAt),
-	}
-
-	// Get connection from pool
-	conn, err := s.getConnection()
-	if err != nil {
-		return fmt.Errorf("failed to get connection: %w", err)
-	}
-	defer s.releaseConnection(conn)
-
-	// Insert data with retry and metric tracking
-	insertStart := time.Now()
-	logger.Debug().Msg("Starting batch insert")
-
-	err = s.withRetry(ctx, func(ctx context.Context) error {
-		_, err := conn.Insert(ctx, s.collection, "", columns...)
-		if err != nil {
-			return fmt.Errorf("failed to insert batch: %w", err)
+		// Check context periodically
+		if offset%1000 == 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
 		}
 
-		// Flush to ensure data is persisted
-		if err := conn.Flush(ctx, s.collection, false); err != nil {
-			return fmt.Errorf("failed to flush after insert: %w", err)
+		start := offset
+		offset += len(item.Vector)
+		if offset > cap(vectorBuffer) {
+			// Grow buffer if needed
+			newBuf := make([]float32, 0, offset*2)
+			copy(newBuf, vectorBuffer)
+			vectorBuffer = newBuf
+		}
+		vectorBuffer = vectorBuffer[:offset]
+		copy(vectorBuffer[start:], item.Vector)
+		vectors = append(vectors, vectorBuffer[start:offset])
+	}
+
+	// Create a child context with timeout
+	processCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Process vectors using batch processor
+	err := s.batchProc.ProcessBatch(vectors, func(vec []float32) error {
+		// Check context before each vector processing
+		select {
+		case <-processCtx.Done():
+			return processCtx.Err()
+		default:
 		}
 
-		// Load collection to ensure data is indexed
-		if err := conn.LoadCollection(ctx, s.collection, false); err != nil {
-			return fmt.Errorf("failed to load collection after insert: %w", err)
-		}
+		// Store vector in lock-free store
+		idx := s.vectorStore.Add(vec)
+
+		// Update metadata with vector index
+		item := batch[len(vectors)-1] // Get corresponding item
+		item.Metadata["vector_idx"] = idx
 
 		return nil
 	})
 
 	if err != nil {
-		atomic.AddInt64(&s.metrics.failedInserts, 1)
-		logger.Error().
-			Err(err).
-			Dur("duration", time.Since(insertStart)).
-			Msg("Batch insert failed")
-		return fmt.Errorf("failed to insert batch: %w", err)
+		s.batchMetrics.failureCount.Add(1)
+		return fmt.Errorf("failed to process vectors: %w", err)
 	}
 
-	insertDuration := time.Since(insertStart)
-	atomic.AddInt64(&s.metrics.totalInsertTime, insertDuration.Nanoseconds())
-	atomic.AddInt64(&s.metrics.totalInserts, int64(len(batch)))
-
-	logger.Debug().
-		Dur("duration", insertDuration).
-		Msg("Batch inserted")
-
-	// Update cache in background with rate limiting
-	go func() {
-		for _, item := range batch {
-			select {
-			case <-time.After(time.Millisecond): // Rate limit cache updates
-				s.localCache.Add(item.ID, item)
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
+	s.batchMetrics.processingTime.Add(time.Since(start).Nanoseconds())
 	return nil
 }
 
@@ -2441,6 +2907,31 @@ func (s *MilvusStore) Insert(ctx context.Context, items []*storage.Item) error {
 	logger := s.logger.With().Str("operation", "Insert").Int("item_count", len(items)).Logger()
 	logger.Debug().Msg("Starting insertion of items")
 
+	// Use concurrent index updater for all index operations
+	for _, item := range items {
+		if err := s.indexUpdater.Insert(item.ID, item.Vector); err != nil {
+			return fmt.Errorf("failed to update indexes for item %s: %w", item.ID, err)
+		}
+	}
+
+	// Extract vectors for quantization
+	vectors := make([][]float32, len(items))
+	for i, item := range items {
+		vectors[i] = item.Vector
+	}
+
+	// Quantize vectors in parallel
+	centroids, distances, err := s.quantizer.QuantizeBatch(ctx, vectors)
+	if err != nil {
+		return fmt.Errorf("failed to quantize vectors: %w", err)
+	}
+
+	// Update items with quantized information
+	for i, item := range items {
+		item.Metadata["centroid"] = centroids[i]
+		item.Metadata["distances"] = distances[i]
+	}
+
 	// For large batches, process directly
 	if len(items) > maxBufferSize {
 		return s.processLargeBatch(ctx, items)
@@ -2548,4 +3039,361 @@ func (p *vectorWorkerPool) stop() {
 	close(p.tasks)
 	p.wg.Wait()
 	close(p.results)
+}
+
+// Add after vectorBufferPool struct
+
+// LockFreeVectorStore provides concurrent vector storage without locks
+// using atomic operations and sharding for high-performance vector operations.
+type LockFreeVectorStore struct {
+	// vectors stores the actual vector data in a contiguous memory layout
+	vectors []float32
+	// metadata stores additional information about each vector
+	metadata []uint64
+	// dimension is the size of each vector
+	dimension int
+	// size tracks the number of vectors currently stored
+	size atomic.Int64
+	// capacity tracks the total storage capacity
+	capacity atomic.Int64
+	// chunks holds vector data in fixed-size chunks for better memory management
+	// and concurrent access. Each chunk is protected by atomic operations.
+	chunks []atomic.Value // Each chunk holds vectorChunkSize vectors
+}
+
+// NewLockFreeVectorStore creates a new lock-free vector store with the specified
+// dimension and initial capacity. It uses atomic operations and chunking for
+// thread-safe concurrent access without traditional locks.
+func NewLockFreeVectorStore(dimension int, initialCapacity int) *LockFreeVectorStore {
+	store := &LockFreeVectorStore{
+		dimension: dimension,
+		chunks:    make([]atomic.Value, (initialCapacity+vectorChunkSize-1)/vectorChunkSize),
+	}
+	store.capacity.Store(int64(initialCapacity))
+
+	// Initialize chunks with zero-filled vectors
+	for i := range store.chunks {
+		chunk := make([]float32, vectorChunkSize*dimension)
+		store.chunks[i].Store(chunk)
+	}
+
+	return store
+}
+
+// Add adds a vector to the store and returns its index.
+// This operation is thread-safe and lock-free, using atomic operations
+// to manage concurrent access.
+func (s *LockFreeVectorStore) Add(vector []float32) uint64 {
+	idx := s.size.Add(1) - 1
+	chunkIdx := idx / int64(vectorChunkSize)
+	offsetInChunk := (idx % int64(vectorChunkSize)) * int64(s.dimension)
+
+	// Get current chunk using atomic operation
+	chunk := s.chunks[chunkIdx].Load().([]float32)
+
+	// Copy vector data
+	copy(chunk[offsetInChunk:], vector)
+
+	return uint64(idx)
+}
+
+// Get retrieves a vector by its index in a thread-safe manner.
+// Returns the vector and a boolean indicating whether the vector was found.
+func (s *LockFreeVectorStore) Get(idx uint64) ([]float32, bool) {
+	if idx >= uint64(s.size.Load()) {
+		return nil, false
+	}
+
+	chunkIdx := idx / uint64(vectorChunkSize)
+	offsetInChunk := (idx % uint64(vectorChunkSize)) * uint64(s.dimension)
+
+	// Get chunk using atomic operation
+	chunk := s.chunks[chunkIdx].Load().([]float32)
+	vector := make([]float32, s.dimension)
+	copy(vector, chunk[offsetInChunk:offsetInChunk+uint64(s.dimension)])
+
+	return vector, true
+}
+
+// Add vector pool helper methods
+func (s *MilvusStore) getVectorBuffer(size int) []float32 {
+	return s.vectorPool.get(size * s.dimension)
+}
+
+func (s *MilvusStore) putVectorBuffer(buf []float32) {
+	s.vectorPool.put(buf)
+}
+
+// Add adaptive batch sizing methods
+func (s *MilvusStore) getOptimalBatchSize() int {
+	// Get current metrics
+	successCount := s.batchMetrics.successCount.Load()
+	if successCount == 0 {
+		return s.batchSize // Use default if no data
+	}
+
+	avgLatency := time.Duration(s.batchMetrics.totalLatency.Load() / successCount)
+	failureRate := float64(s.batchMetrics.failureCount.Load()) / float64(successCount)
+	currentBatchSize := s.batchMetrics.batchSize.Load()
+
+	// Get system load
+	var load float64
+	if info, err := getSystemLoad(); err == nil {
+		load = info.Load1
+	}
+
+	// Adjust batch size based on metrics
+	var newBatchSize int64
+	switch {
+	case failureRate > 0.1: // High failure rate
+		newBatchSize = int64(float64(currentBatchSize) * 0.8)
+	case failureRate < 0.01 && avgLatency < 100*time.Millisecond && load < 0.7:
+		// Good performance, low load
+		newBatchSize = int64(float64(currentBatchSize) * 1.2)
+	default:
+		newBatchSize = currentBatchSize
+	}
+
+	// Apply bounds
+	if newBatchSize < 100 {
+		newBatchSize = 100
+	}
+	if newBatchSize > maxBufferSize {
+		newBatchSize = maxBufferSize
+	}
+
+	return int(newBatchSize)
+}
+
+// Add system load monitoring
+type systemLoad struct {
+	Load1  float64
+	Load5  float64
+	Load15 float64
+}
+
+func getSystemLoad() (*systemLoad, error) {
+	// Read system load average
+	data, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return nil, err
+	}
+
+	fields := strings.Fields(string(data))
+	if len(fields) < 3 {
+		return nil, fmt.Errorf("invalid load average data")
+	}
+
+	load1, _ := strconv.ParseFloat(fields[0], 64)
+	load5, _ := strconv.ParseFloat(fields[1], 64)
+	load15, _ := strconv.ParseFloat(fields[2], 64)
+
+	return &systemLoad{
+		Load1:  load1,
+		Load5:  load5,
+		Load15: load15,
+	}, nil
+}
+
+// Add queryItems method
+func (s *MilvusStore) queryItems(ctx context.Context, expr string, limit int) ([]*storage.Item, error) {
+	// Get connection from pool
+	conn, err := s.getConnection()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get connection: %w", err)
+	}
+	defer s.releaseConnection(conn)
+
+	// Define output fields
+	outputFields := "id,vector,content_type,content_data,metadata,created_at,expires_at"
+	partitionNames := []string{}
+
+	// Ensure collection is loaded
+	if err := conn.LoadCollection(ctx, s.collection, false); err != nil {
+		return nil, fmt.Errorf("failed to load collection: %w", err)
+	}
+
+	// Execute query
+	queryStart := time.Now()
+	results, err := conn.Query(
+		ctx,
+		s.collection,
+		[]string{expr},
+		outputFields,
+		partitionNames,
+		client.WithLimit(int64(limit)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query operation failed: %w", err)
+	}
+	s.logger.Debug().
+		Dur("duration", time.Since(queryStart)).
+		Msg("Query completed")
+
+	// Process results
+	return s.processQueryResults(results)
+}
+
+// processQueryResults converts Milvus query results into storage items
+func (s *MilvusStore) processQueryResults(results client.ResultSet) ([]*storage.Item, error) {
+	if results == nil {
+		return nil, fmt.Errorf("no results found")
+	}
+
+	// Get field values
+	idColumn := results.GetColumn("id").(*entity.ColumnVarChar).Data()
+	vectorColumn := results.GetColumn("vector").(*entity.ColumnFloat).Data()
+	contentTypeColumn := results.GetColumn("content_type").(*entity.ColumnInt32).Data()
+	contentDataColumn := results.GetColumn("content_data").(*entity.ColumnVarChar).Data()
+	metadataColumn := results.GetColumn("metadata").(*entity.ColumnVarChar).Data()
+	createdAtColumn := results.GetColumn("created_at").(*entity.ColumnInt64).Data()
+	expiresAtColumn := results.GetColumn("expires_at").(*entity.ColumnInt64).Data()
+
+	if len(idColumn) == 0 {
+		return nil, fmt.Errorf("no results found")
+	}
+
+	items := make([]*storage.Item, 0, len(idColumn))
+	for i := 0; i < len(idColumn); i++ {
+		vector := vectorColumn[i*s.dimension : (i+1)*s.dimension]
+
+		// Parse metadata JSON
+		var metadata map[string]interface{}
+		if err := json.Unmarshal([]byte(metadataColumn[i]), &metadata); err != nil {
+			return nil, fmt.Errorf("failed to parse metadata: %w", err)
+		}
+
+		// Create content
+		content := storage.Content{
+			Type: storage.ContentType(contentTypeColumn[i]),
+			Data: []byte(contentDataColumn[i]),
+		}
+
+		item := &storage.Item{
+			ID:        idColumn[i],
+			Vector:    vector,
+			Content:   content,
+			Metadata:  metadata,
+			CreatedAt: time.Unix(0, createdAtColumn[i]),
+			ExpiresAt: time.Unix(0, expiresAtColumn[i]),
+		}
+		items = append(items, item)
+	}
+
+	return items, nil
+}
+
+// monitorIndexPerformance periodically evaluates index performance
+func (s *MilvusStore) monitorIndexPerformance() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.indexStats.RLock()
+		totalSearches := s.indexStats.totalSearches
+		successSearches := s.indexStats.successSearches
+		var avgLatency time.Duration
+		if len(s.indexStats.searchLatency) > 0 {
+			var total time.Duration
+			for _, lat := range s.indexStats.searchLatency {
+				total += lat
+			}
+			avgLatency = total / time.Duration(len(s.indexStats.searchLatency))
+		}
+		hitRate := float64(successSearches) / float64(totalSearches)
+		s.indexStats.RUnlock()
+
+		// Update adaptive index stats with current index type
+		s.adaptiveIndex.UpdateStats(
+			IndexTypeHNSW, // Default to HNSW as current index
+			avgLatency,
+			hitRate > 0.9,
+			s.getCurrentMemoryUsage(),
+		)
+
+		// Clear old stats
+		s.indexStats.Lock()
+		s.indexStats.searchLatency = s.indexStats.searchLatency[:0]
+		s.indexStats.Unlock()
+	}
+}
+
+// getCurrentMemoryUsage returns the current memory usage of the index
+func (s *MilvusStore) getCurrentMemoryUsage() int64 {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return int64(m.Alloc)
+}
+
+// lshSearch performs LSH-based vector search
+func (s *MilvusStore) lshSearch(ctx context.Context, vector []float32, limit int) ([]*storage.Item, error) {
+	// Use LSH index for approximate search
+	candidates := s.lshIndex.Query(vector, limit*2) // Get 2x candidates for better recall
+	items := make([]*storage.Item, 0, len(candidates))
+
+	for _, candidate := range candidates {
+		item, err := s.getItemByID(ctx, candidate.id)
+		if err != nil {
+			s.logger.Warn().
+				Err(err).
+				Str("item_id", candidate.id).
+				Msg("Failed to get item data")
+			continue
+		}
+		if item != nil {
+			items = append(items, item)
+		}
+	}
+
+	return items, nil
+}
+
+// quantizationSearch performs quantization-based vector search
+func (s *MilvusStore) quantizationSearch(ctx context.Context, vector []float32, limit int) ([]*storage.Item, error) {
+	// Quantize the query vector
+	centroid, distances, err := s.quantizer.QuantizeVector(ctx, vector)
+	if err != nil {
+		return nil, fmt.Errorf("failed to quantize query vector: %w", err)
+	}
+
+	// Search using quantized vector and distances
+	expr := fmt.Sprintf("centroid == '%v' AND distances <= %v", centroid, distances[0])
+	items, err := s.queryItems(ctx, expr, limit*2)
+	if err != nil {
+		return nil, err
+	}
+
+	// Rerank results using actual distances
+	if len(items) > 0 {
+		sort.Slice(items, func(i, j int) bool {
+			distI := computeL2Distance(vector, items[i].Vector)
+			distJ := computeL2Distance(vector, items[j].Vector)
+			return distI < distJ
+		})
+
+		if len(items) > limit {
+			items = items[:limit]
+		}
+	}
+
+	return items, nil
+}
+
+// getDatasetSize returns the current size of the dataset
+func (s *MilvusStore) getDatasetSize(ctx context.Context) int64 {
+	conn, err := s.getConnection()
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Failed to get connection for dataset size check")
+		return 0
+	}
+	defer s.releaseConnection(conn)
+
+	stats, err := conn.GetCollectionStatistics(ctx, s.collection)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Failed to get collection statistics")
+		return 0
+	}
+
+	rowCount, _ := strconv.ParseInt(stats["row_count"], 10, 64)
+	return rowCount
 }

@@ -1,4 +1,4 @@
-.PHONY: all build clean test coverage lint run install test-embeddings test-embeddings-debug
+.PHONY: all build clean test coverage lint run install test-storage test-storage-unit test-storage-integration test-storage-debug test-env-up test-env-down
 
 # Build variables
 BINARY_NAME=athena
@@ -12,7 +12,7 @@ PROJECT_NAME=athena
 PROJECT_ROOT=$(shell pwd)
 
 # Test variables
-TEST_ENV=TEST_MODELS_DIR=$(PROJECT_ROOT)/models TEST_DATA_PATH=$(PROJECT_ROOT)/test/integration/testdata DYLD_LIBRARY_PATH=$(PROJECT_ROOT)/onnxruntime-osx-arm64-1.14.0/lib
+TEST_ENV=TEST_DATA_PATH=$(PROJECT_ROOT)/test/integration/testdata
 DEBUG_ENV=ZEROLOG_LEVEL=debug
 
 all: lint test build
@@ -26,18 +26,6 @@ clean:
 
 test:
 	$(GO) test -v -race ./...
-
-test-embeddings:
-	$(TEST_ENV) $(GO) test -v ./test/unit -run TestONNXService
-	$(TEST_ENV) $(GO) test -v ./test/integration -run TestONNXIntegration
-
-test-embeddings-unit:
-	$(TEST_ENV) $(DEBUG_ENV) $(GO) test -count=1 -v ./test/unit -run TestONNXService
-
-test-embeddings-integration:
-	$(TEST_ENV) $(DEBUG_ENV) $(GO) test -count=1 -v ./test/integration -run TestONNXIntegration
-
-test-embeddings-debug: test-embeddings-unit test-embeddings-integration
 
 coverage:
 	$(GO) test -v -coverprofile=coverage.out ./...
@@ -58,28 +46,45 @@ generate:
 # Development helpers
 dev: install generate build run
 
-# Docker commands (for future use)
+# Docker commands
 docker-build:
 	docker build -t $(PROJECT_NAME) .
 
 docker-run:
 	docker run -p 8080:8080 $(PROJECT_NAME)
 
-# Embeddings test targets
-.PHONY: test-embeddings test-embeddings-unit test-embeddings-integration test-embeddings-bench test-embeddings-all test-embeddings-similarity
+# Test environment commands
+test-env-up:
+	mkdir -p volumes/milvus
+	docker-compose -f docker-compose.test.yml up -d
+	@echo "Waiting for services to be healthy..."
+	@for i in $$(seq 1 60); do \
+		if docker-compose -f docker-compose.test.yml ps | grep -q "(healthy)"; then \
+			echo "Test environment is ready"; \
+			break; \
+		fi; \
+		if [ $$i -eq 60 ]; then \
+			echo "Timeout waiting for services to be healthy"; \
+			exit 1; \
+		fi; \
+		sleep 1; \
+	done
 
-test-embeddings-unit:
-	$(TEST_ENV) $(DEBUG_ENV) $(GO) test -count=1 -v ./test/unit -run TestONNXService
+test-env-down:
+	docker-compose -f docker-compose.test.yml down -v
+	rm -rf volumes
 
-test-embeddings-integration:
-	$(TEST_ENV) $(DEBUG_ENV) $(GO) test -count=1 -v ./test/integration -run TestONNXClient
+# Storage test targets
+test-storage: test-env-up
+	$(TEST_ENV) $(GO) test -v ./test/unit -run "TestShardedCache"
+	$(TEST_ENV) $(GO) test -v ./test/integration -run "TestStorageIntegration"
+	make test-env-down
 
-test-embeddings-bench:
-	$(TEST_ENV) $(DEBUG_ENV) $(GO) test -v ./test/integration -run=^$ -bench=BenchmarkONNXClient
+test-storage-unit:
+	$(TEST_ENV) $(DEBUG_ENV) $(GO) test -count=1 -v ./test/unit -run "TestShardedCache"
 
-test-embeddings-similarity:
-	$(TEST_ENV) $(DEBUG_ENV) $(GO) test -count=1 -v ./test/integration -run "TestONNXClient/.*Semantic_Similarity$$"
+test-storage-integration: test-env-up
+	$(TEST_ENV) $(DEBUG_ENV) $(GO) test -count=1 -v ./test/integration -run "TestStorageIntegration"
+	make test-env-down
 
-test-embeddings: test-embeddings-unit test-embeddings-integration
-
-test-embeddings-all: test-embeddings test-embeddings-bench test-embeddings-similarity
+test-storage-debug: test-storage-unit test-storage-integration

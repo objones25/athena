@@ -3,287 +3,346 @@ package unit
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/objones25/athena/internal/storage"
-	"github.com/objones25/athena/internal/storage/mock"
-	"github.com/objones25/athena/test/testutil"
-	"github.com/rs/zerolog"
+	"github.com/objones25/athena/internal/storage/milvus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestMain(m *testing.M) {
-	// Initialize test logger
-	testutil.InitTestLogger()
-	// Set default test log level
-	testutil.SetLogLevel(testutil.ParseLogLevel(zerolog.WarnLevel))
-	m.Run()
-}
+func TestMilvusStore(t *testing.T) {
+	// Create test configuration
+	cfg := milvus.Config{
+		Host:           "localhost",
+		Port:           19530,
+		CollectionName: "test_collection",
+		Dimension:      768,
+		BatchSize:      1000,
+		MaxRetries:     3,
+		PoolSize:       5,
+		Quantization: milvus.QuantizationConfig{
+			NumCentroids:     256,
+			MaxIterations:    100,
+			ConvergenceEps:   1e-6,
+			SampleSize:       10000,
+			BatchSize:        1000,
+			UpdateInterval:   1 * time.Hour,
+			NumWorkers:       4,
+			QuantizationType: milvus.StandardQuantization,
+			NumSubspaces:     8,
+			NumBitsPerIdx:    8,
+			OptimisticProbe:  8,
+		},
+	}
 
-func TestStorageOperations(t *testing.T) {
-	store := mock.NewMockStore()
-	ctx := context.Background()
+	t.Run("Store_Initialization", func(t *testing.T) {
+		ctx := context.Background()
 
-	t.Run("Basic Operations", func(t *testing.T) {
-		// Set debug level for this specific test
-		cleanup := testutil.TestLogLevel(t, zerolog.DebugLevel)
-		defer cleanup()
+		// Test successful initialization
+		store, err := milvus.NewMilvusStore(cfg)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+		defer store.Close()
 
-		// Test item creation
+		// Test health check
+		err = store.Health(ctx)
+		assert.NoError(t, err)
+
+		// Test invalid configuration
+		invalidCfg := cfg
+		invalidCfg.Dimension = 0
+		_, err = milvus.NewMilvusStore(invalidCfg)
+		assert.Error(t, err)
+
+		invalidCfg = cfg
+		invalidCfg.BatchSize = 0
+		_, err = milvus.NewMilvusStore(invalidCfg)
+		assert.Error(t, err)
+	})
+
+	t.Run("Basic_Operations", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := milvus.NewMilvusStore(cfg)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+		defer store.Close()
+
+		// Create test item
+		vector := make([]float32, cfg.Dimension)
+		for i := range vector {
+			vector[i] = rand.Float32()
+		}
 		item := &storage.Item{
-			ID: "test1",
+			ID:     "test_item",
+			Vector: vector,
 			Content: storage.Content{
 				Type: storage.ContentTypeText,
 				Data: []byte("test content"),
 			},
-			Vector: []float32{1.0, 2.0, 3.0},
 			Metadata: map[string]interface{}{
 				"test": "metadata",
 			},
 			CreatedAt: time.Now(),
-			ExpiresAt: time.Now().Add(24 * time.Hour),
+			ExpiresAt: time.Now().Add(time.Hour),
 		}
 
-		// Test Set
-		err := store.Set(ctx, item.ID, item)
+		// Test insert
+		err = store.Insert(ctx, []*storage.Item{item})
 		require.NoError(t, err)
 
-		// Test Get
-		retrieved, err := store.Get(ctx, item.ID)
+		// Test search
+		results, err := store.Search(ctx, item.Vector, 1)
 		require.NoError(t, err)
-		assert.Equal(t, item.ID, retrieved.ID)
-		assert.Equal(t, item.Content.Type, retrieved.Content.Type)
-		assert.Equal(t, item.Content.Data, retrieved.Content.Data)
-		assert.Equal(t, item.Vector, retrieved.Vector)
-		assert.Equal(t, item.Metadata["test"], retrieved.Metadata["test"])
+		require.NotEmpty(t, results)
+		assert.Equal(t, item.ID, results[0].ID)
+		assert.Equal(t, item.Content.Type, results[0].Content.Type)
+		assert.Equal(t, item.Content.Data, results[0].Content.Data)
+		assert.Equal(t, item.Metadata["test"], results[0].Metadata["test"])
 
-		// Test Delete
-		err = store.DeleteFromCache(ctx, item.ID)
+		// Test delete
+		err = store.DeleteFromStore(ctx, []string{item.ID})
 		require.NoError(t, err)
 
 		// Verify deletion
-		retrieved, err = store.Get(ctx, item.ID)
+		results, err = store.Search(ctx, item.Vector, 1)
 		require.NoError(t, err)
-		assert.Nil(t, retrieved)
+		assert.Empty(t, results)
 	})
 
-	t.Run("Batch Operations", func(t *testing.T) {
-		items := make(map[string]*storage.Item)
-		for i := 0; i < 10; i++ {
-			item := &storage.Item{
-				ID: fmt.Sprintf("batch%d", i),
+	t.Run("Batch_Operations", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := milvus.NewMilvusStore(cfg)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+		defer store.Close()
+
+		// Create batch of items
+		numItems := 100
+		items := make([]*storage.Item, numItems)
+		for i := range items {
+			vector := make([]float32, cfg.Dimension)
+			for j := range vector {
+				vector[j] = rand.Float32()
+			}
+			items[i] = &storage.Item{
+				ID:     fmt.Sprintf("batch_item_%d", i),
+				Vector: vector,
 				Content: storage.Content{
 					Type: storage.ContentTypeText,
-					Data: []byte(fmt.Sprintf("content %d", i)),
+					Data: []byte(fmt.Sprintf("batch content %d", i)),
 				},
-				Vector:    []float32{float32(i), float32(i + 1)},
+				Metadata: map[string]interface{}{
+					"index": i,
+				},
 				CreatedAt: time.Now(),
-				ExpiresAt: time.Now().Add(24 * time.Hour),
+				ExpiresAt: time.Now().Add(time.Hour),
 			}
-			items[item.ID] = item
 		}
 
-		// Test BatchSet
-		err := store.BatchSet(ctx, items)
+		// Test batch insert
+		err = store.Insert(ctx, items)
 		require.NoError(t, err)
 
-		// Test BatchGet
-		keys := make([]string, 0, len(items))
-		for k := range items {
-			keys = append(keys, k)
-		}
-		retrieved, err := store.BatchGet(ctx, keys)
-		require.NoError(t, err)
-		assert.Equal(t, len(items), len(retrieved))
-
-		// Verify each item
-		for id, item := range items {
-			retrieved, ok := retrieved[id]
-			assert.True(t, ok)
-			assert.Equal(t, item.ID, retrieved.ID)
-			assert.Equal(t, item.Content.Data, retrieved.Content.Data)
-		}
-	})
-
-	t.Run("Vector Operations", func(t *testing.T) {
-		vectors := []*storage.Item{
-			{
-				ID: "vec1",
-				Content: storage.Content{
-					Type: storage.ContentTypeText,
-					Data: []byte("vector 1"),
-				},
-				Vector: []float32{1.0, 0.0, 0.0},
-			},
-			{
-				ID: "vec2",
-				Content: storage.Content{
-					Type: storage.ContentTypeText,
-					Data: []byte("vector 2"),
-				},
-				Vector: []float32{0.0, 1.0, 0.0},
-			},
+		// Test search for each item
+		for _, item := range items {
+			results, err := store.Search(ctx, item.Vector, 1)
+			require.NoError(t, err)
+			require.NotEmpty(t, results)
+			assert.Equal(t, item.ID, results[0].ID)
 		}
 
-		// Test Insert
-		err := store.Insert(ctx, vectors)
-		require.NoError(t, err)
-
-		// Test Search
-		results, err := store.Search(ctx, []float32{1.0, 0.0, 0.0}, 2)
-		require.NoError(t, err)
-		assert.GreaterOrEqual(t, len(results), 1)
-
-		// Test Update
-		vectors[0].Content.Data = []byte("updated vector 1")
-		err = store.Update(ctx, vectors[:1])
-		require.NoError(t, err)
-
-		// Verify update
-		results, err = store.Search(ctx, []float32{1.0, 0.0, 0.0}, 1)
-		require.NoError(t, err)
-		assert.Equal(t, "updated vector 1", string(results[0].Content.Data))
-
-		// Test Delete
-		err = store.DeleteFromStore(ctx, []string{"vec1"})
+		// Test batch delete
+		ids := make([]string, len(items))
+		for i, item := range items {
+			ids[i] = item.ID
+		}
+		err = store.DeleteFromStore(ctx, ids)
 		require.NoError(t, err)
 
 		// Verify deletion
-		results, err = store.Search(ctx, []float32{1.0, 0.0, 0.0}, 1)
+		for _, item := range items {
+			results, err := store.Search(ctx, item.Vector, 1)
+			require.NoError(t, err)
+			assert.Empty(t, results)
+		}
+	})
+
+	t.Run("Vector_Quantization", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := milvus.NewMilvusStore(cfg)
 		require.NoError(t, err)
-		for _, result := range results {
-			assert.NotEqual(t, "vec1", result.ID)
+		require.NotNil(t, store)
+		defer store.Close()
+
+		// Create test vectors with known similarities
+		numVectors := 1000
+		baseVector := make([]float32, cfg.Dimension)
+		for i := range baseVector {
+			baseVector[i] = rand.Float32()
 		}
-	})
 
-	t.Run("Error Handling", func(t *testing.T) {
-		store.SetFailRate(0.5) // 50% failure rate
-		store.SetLatency(10 * time.Millisecond)
+		items := make([]*storage.Item, numVectors)
+		for i := range items {
+			vector := make([]float32, cfg.Dimension)
+			copy(vector, baseVector)
 
-		item := &storage.Item{ID: "error_test"}
-
-		// Test multiple operations to ensure some fail
-		for i := 0; i < 10; i++ {
-			err := store.Set(ctx, item.ID, item)
-			if err != nil {
-				assert.Contains(t, err.Error(), "simulated failure")
+			// Add controlled noise
+			noise := float32(i) / float32(numVectors)
+			for j := range vector {
+				vector[j] += rand.Float32() * noise
 			}
-		}
 
-		// Reset failure rate
-		store.SetFailRate(0)
-	})
-
-	t.Run("Content Types", func(t *testing.T) {
-		contentTypes := []storage.ContentType{
-			storage.ContentTypeText,
-			storage.ContentTypeCode,
-			storage.ContentTypeMath,
-			storage.ContentTypeJSON,
-			storage.ContentTypeMarkdown,
-		}
-
-		for _, ct := range contentTypes {
-			item := &storage.Item{
-				ID: fmt.Sprintf("content_%s", ct),
+			items[i] = &storage.Item{
+				ID:     fmt.Sprintf("quant_item_%d", i),
+				Vector: vector,
 				Content: storage.Content{
-					Type: ct,
-					Data: []byte("test content"),
+					Type: storage.ContentTypeText,
+					Data: []byte(fmt.Sprintf("quantization content %d", i)),
 				},
+				Metadata: map[string]interface{}{
+					"noise_level": noise,
+				},
+				CreatedAt: time.Now(),
+				ExpiresAt: time.Now().Add(time.Hour),
 			}
-
-			err := store.Set(ctx, item.ID, item)
-			require.NoError(t, err)
-
-			retrieved, err := store.Get(ctx, item.ID)
-			require.NoError(t, err)
-			assert.Equal(t, ct, retrieved.Content.Type)
 		}
+
+		// Insert vectors
+		err = store.Insert(ctx, items)
+		require.NoError(t, err)
+
+		// Search with base vector
+		results, err := store.Search(ctx, baseVector, 10)
+		require.NoError(t, err)
+		assert.Len(t, results, 10)
+
+		// Verify results are ordered by similarity (noise level)
+		for i := 1; i < len(results); i++ {
+			prevNoise := results[i-1].Metadata["noise_level"].(float32)
+			currNoise := results[i].Metadata["noise_level"].(float32)
+			assert.True(t, prevNoise <= currNoise, "Results should be ordered by similarity")
+		}
+
+		// Clean up
+		ids := make([]string, len(items))
+		for i, item := range items {
+			ids[i] = item.ID
+		}
+		err = store.DeleteFromStore(ctx, ids)
+		require.NoError(t, err)
 	})
 
-	t.Run("Concurrent Operations", func(t *testing.T) {
-		const goroutines = 10
-		const operationsPerGoroutine = 100
+	t.Run("Concurrent_Access", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := milvus.NewMilvusStore(cfg)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+		defer store.Close()
 
+		// Create test vectors
+		numVectors := 100
+		items := make([]*storage.Item, numVectors)
+		for i := range items {
+			vector := make([]float32, cfg.Dimension)
+			for j := range vector {
+				vector[j] = rand.Float32()
+			}
+			items[i] = &storage.Item{
+				ID:     fmt.Sprintf("concurrent_item_%d", i),
+				Vector: vector,
+				Content: storage.Content{
+					Type: storage.ContentTypeText,
+					Data: []byte(fmt.Sprintf("concurrent content %d", i)),
+				},
+				CreatedAt: time.Now(),
+				ExpiresAt: time.Now().Add(time.Hour),
+			}
+		}
+
+		// Insert vectors
+		err = store.Insert(ctx, items)
+		require.NoError(t, err)
+
+		// Run concurrent operations
+		numGoroutines := 10
 		var wg sync.WaitGroup
-		errors := make(chan error, goroutines*operationsPerGoroutine)
+		wg.Add(numGoroutines)
+		errChan := make(chan error, numGoroutines)
 
-		for i := 0; i < goroutines; i++ {
-			wg.Add(1)
+		for i := 0; i < numGoroutines; i++ {
 			go func(routineID int) {
 				defer wg.Done()
-				for j := 0; j < operationsPerGoroutine; j++ {
-					item := &storage.Item{
-						ID: fmt.Sprintf("concurrent_%d_%d", routineID, j),
-						Content: storage.Content{
-							Type: storage.ContentTypeText,
-							Data: []byte("concurrent test"),
-						},
-					}
 
-					if err := store.Set(ctx, item.ID, item); err != nil {
-						errors <- err
-						continue
+				// Mix of operations
+				for j := 0; j < 10; j++ {
+					switch j % 3 {
+					case 0:
+						// Search operation
+						queryVector := make([]float32, cfg.Dimension)
+						for k := range queryVector {
+							queryVector[k] = rand.Float32()
+						}
+						results, err := store.Search(ctx, queryVector, 5)
+						if err != nil {
+							errChan <- fmt.Errorf("search error in routine %d: %w", routineID, err)
+							return
+						}
+						if len(results) == 0 {
+							errChan <- fmt.Errorf("no results in routine %d", routineID)
+							return
+						}
+					case 1:
+						// Insert operation
+						vector := make([]float32, cfg.Dimension)
+						for k := range vector {
+							vector[k] = rand.Float32()
+						}
+						item := &storage.Item{
+							ID:     fmt.Sprintf("concurrent_new_item_%d_%d", routineID, j),
+							Vector: vector,
+							Content: storage.Content{
+								Type: storage.ContentTypeText,
+								Data: []byte(fmt.Sprintf("concurrent new content %d_%d", routineID, j)),
+							},
+							CreatedAt: time.Now(),
+							ExpiresAt: time.Now().Add(time.Hour),
+						}
+						if err := store.Insert(ctx, []*storage.Item{item}); err != nil {
+							errChan <- fmt.Errorf("insert error in routine %d: %w", routineID, err)
+							return
+						}
+					case 2:
+						// Delete operation
+						id := fmt.Sprintf("concurrent_item_%d", rand.Intn(numVectors))
+						if err := store.DeleteFromStore(ctx, []string{id}); err != nil {
+							errChan <- fmt.Errorf("delete error in routine %d: %w", routineID, err)
+							return
+						}
 					}
-
-					if _, err := store.Get(ctx, item.ID); err != nil {
-						errors <- err
-					}
+					time.Sleep(time.Millisecond * time.Duration(rand.Intn(10)))
 				}
 			}(i)
 		}
 
+		// Wait for all goroutines to complete
 		wg.Wait()
-		close(errors)
+		close(errChan)
 
-		var errCount int
-		for err := range errors {
-			t.Logf("Concurrent operation error: %v", err)
-			errCount++
+		// Check for errors
+		for err := range errChan {
+			t.Error(err)
 		}
 
-		assert.Zero(t, errCount, "Expected no errors in concurrent operations")
-	})
-
-	t.Run("Performance", func(t *testing.T) {
-		if testing.Short() {
-			t.Skip("Skipping performance test in short mode")
+		// Clean up
+		ids := make([]string, len(items))
+		for i, item := range items {
+			ids[i] = item.ID
 		}
-
-		store.SetLatency(0) // Reset latency for performance testing
-
-		// Prepare test data
-		const itemCount = 10000
-		items := make(map[string]*storage.Item)
-		for i := 0; i < itemCount; i++ {
-			items[fmt.Sprintf("perf_%d", i)] = &storage.Item{
-				ID: fmt.Sprintf("perf_%d", i),
-				Content: storage.Content{
-					Type: storage.ContentTypeText,
-					Data: []byte("performance test"),
-				},
-			}
-		}
-
-		// Test batch operations performance
-		start := time.Now()
-		err := store.BatchSet(ctx, items)
+		err = store.DeleteFromStore(ctx, ids)
 		require.NoError(t, err)
-		batchDuration := time.Since(start)
-
-		// Test individual operations performance
-		start = time.Now()
-		for id, item := range items {
-			err := store.Set(ctx, id, item)
-			require.NoError(t, err)
-		}
-		individualDuration := time.Since(start)
-
-		// Assert batch operations are significantly faster
-		assert.Less(t, batchDuration, individualDuration/2,
-			"Expected batch operations to be at least 2x faster than individual operations")
 	})
 }

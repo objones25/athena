@@ -9,145 +9,106 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
-	"github.com/yalue/onnxruntime_go"
+	"github.com/objones25/athena/internal/storage/cache"
+	"github.com/objones25/athena/internal/storage/manager"
+	"github.com/objones25/athena/internal/storage/milvus"
 )
 
 // TestTimeout is the default timeout for integration tests
 const TestTimeout = 5 * time.Minute
 
-func init() {
-	// Set ONNX runtime shared library path from environment variable
-	libPath := os.Getenv("DYLD_LIBRARY_PATH")
-	if libPath == "" {
+// setupTestStore creates a new storage manager for testing
+func setupTestStore(t *testing.T) (*manager.Manager, error) {
+	config := manager.Config{
+		Cache: struct {
+			Config         cache.Config
+			WarmupInterval time.Duration
+			WarmupQueries  []string
+		}{
+			Config: cache.Config{
+				Host:                 "localhost",
+				Port:                 "6379",
+				DefaultTTL:           24 * time.Hour,
+				PoolSize:             10,
+				MinIdleConns:         2,
+				MaxRetries:           3,
+				CompressionThreshold: 1024,
+			},
+			WarmupInterval: 5 * time.Minute,
+			WarmupQueries:  []string{},
+		},
+		VectorStore: struct {
+			Config milvus.Config
+		}{
+			Config: milvus.Config{
+				Host:           "localhost",
+				Port:           19530,
+				CollectionName: fmt.Sprintf("test_collection_%d", time.Now().UnixNano()),
+				Dimension:      1536,
+				BatchSize:      1000,
+				MaxRetries:     3,
+				PoolSize:       10,
+				Quantization: milvus.QuantizationConfig{
+					NumCentroids:     256,
+					MaxIterations:    50,
+					BatchSize:        1000,
+					NumWorkers:       4,
+					UpdateInterval:   time.Minute,
+					ConvergenceEps:   0.01,
+					SampleSize:       10000,
+					QuantizationType: 1, // Product quantization
+					NumSubspaces:     64,
+					NumBitsPerIdx:    8,
+					OptimisticProbe:  16,
+				},
+				Graph: milvus.GraphConfig{
+					Dimension:      1536,
+					MaxNeighbors:   32,
+					MaxSearchDepth: 64,
+					BatchSize:      1000,
+					NumWorkers:     4,
+					UpdateInterval: time.Minute,
+					MinSimilarity:  0.5,
+					PruneThreshold: 30, // Using integer percentage (30%)
+				},
+			},
+		},
+		MaxRetries:     3,
+		RetryInterval:  time.Second,
+		BreakDuration:  5 * time.Second,
+		HealthInterval: 30 * time.Second,
+	}
+
+	store, err := manager.NewManager(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create test store: %w", err)
+	}
+
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Logf("failed to close test store: %v", err)
+		}
+	})
+
+	// Clear any existing data
+	err = store.DeleteFromStore(context.Background(), []string{"*"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to clear test store: %w", err)
+	}
+
+	return store, nil
+}
+
+// getTestDataPath returns the path to the test data directory
+func getTestDataPath() string {
+	path := os.Getenv("TEST_DATA_PATH")
+	if path == "" {
 		// Fallback to default path
 		_, currentFile, _, ok := runtime.Caller(0)
 		if !ok {
 			panic("Failed to get current file path")
 		}
-		rootDir := filepath.Dir(filepath.Dir(filepath.Dir(currentFile)))
-		libPath = filepath.Join(rootDir, "onnxruntime-osx-arm64-1.14.0", "lib")
+		path = filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(currentFile))), "test", "integration", "testdata")
 	}
-	libPath = filepath.Join(libPath, "libonnxruntime.1.14.0.dylib")
-
-	// Check if library exists
-	if _, err := os.Stat(libPath); os.IsNotExist(err) {
-		panic(fmt.Sprintf("ONNX Runtime library not found at %s", libPath))
-	}
-
-	// Set the library path
-	onnxruntime_go.SetSharedLibraryPath(libPath)
-
-	// Get ONNX runtime version before initialization
-	version := onnxruntime_go.GetVersion()
-	fmt.Printf("ONNX Runtime version: %s\n", version)
-
-	// Initialize ONNX runtime environment
-	if err := onnxruntime_go.InitializeEnvironment(); err != nil {
-		panic(fmt.Sprintf("Failed to initialize ONNX runtime environment: %v", err))
-	}
-
-	// Verify initialization
-	if !onnxruntime_go.IsInitialized() {
-		panic("ONNX Runtime not initialized after successful initialization call")
-	}
-}
-
-// GetTestContext returns a context with timeout for integration tests
-func GetTestContext(t *testing.T) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), TestTimeout)
-}
-
-// GetTestModelPath returns the path to the test ONNX model
-func GetTestModelPath(t *testing.T) string {
-	modelPath := os.Getenv("TEST_ONNX_MODEL_PATH")
-	if modelPath == "" {
-		modelPath = os.Getenv("ONNX_MODEL_PATH")
-	}
-	if modelPath == "" {
-		t.Skip("Neither TEST_ONNX_MODEL_PATH nor ONNX_MODEL_PATH is set")
-	}
-
-	// If it's an absolute path, use it directly
-	if filepath.IsAbs(modelPath) {
-		_, err := os.Stat(modelPath)
-		require.NoError(t, err, "Model file does not exist at %s", modelPath)
-		return modelPath
-	}
-
-	// For relative paths, resolve from project root
-	_, currentFile, _, ok := runtime.Caller(0)
-	require.True(t, ok, "Failed to get current file path")
-
-	// Get the project root directory (two levels up from test/integration)
-	rootDir := filepath.Dir(filepath.Dir(filepath.Dir(currentFile)))
-
-	// Resolve model path relative to project root
-	absPath := filepath.Join(rootDir, modelPath)
-	_, err := os.Stat(absPath)
-	require.NoError(t, err, "Model file does not exist at %s", absPath)
-
-	return absPath
-}
-
-// GetTestDataPath returns the path to the test data directory
-func GetTestDataPath(t *testing.T) string {
-	dataPath := os.Getenv("TEST_DATA_PATH")
-	if dataPath == "" {
-		// Get the absolute path of the current file
-		_, currentFile, _, ok := runtime.Caller(0)
-		require.True(t, ok, "Failed to get current file path")
-
-		// Get the integration test directory
-		integrationDir := filepath.Dir(currentFile)
-
-		// Default to testdata in the integration test directory
-		dataPath = filepath.Join(integrationDir, "testdata")
-	} else if !filepath.IsAbs(dataPath) {
-		// For relative paths, resolve from project root
-		_, currentFile, _, ok := runtime.Caller(0)
-		require.True(t, ok, "Failed to get current file path")
-
-		// Get the project root directory (two levels up from test/integration)
-		rootDir := filepath.Dir(filepath.Dir(filepath.Dir(currentFile)))
-
-		// Resolve data path relative to project root
-		dataPath = filepath.Join(rootDir, dataPath)
-	}
-
-	// Check if directory exists
-	_, err := os.Stat(dataPath)
-	require.NoError(t, err, "Test data directory does not exist at %s", dataPath)
-
-	return dataPath
-}
-
-// LoadTestFile loads a test file from the test data directory
-func LoadTestFile(t *testing.T, filename string) string {
-	path := filepath.Join(GetTestDataPath(t), filename)
-	data, err := os.ReadFile(path)
-	require.NoError(t, err, "Failed to read test file %s", path)
-	return string(data)
-}
-
-// CreateTempDir creates a temporary directory for testing
-func CreateTempDir(t *testing.T) string {
-	dir, err := os.MkdirTemp("", "onnx-test-*")
-	require.NoError(t, err, "Failed to create temp directory")
-	t.Cleanup(func() {
-		os.RemoveAll(dir)
-	})
-	return dir
-}
-
-// WaitForCondition waits for a condition to be true with timeout
-func WaitForCondition(t *testing.T, condition func() bool, timeout time.Duration, message string) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatalf("Timeout waiting for condition: %s", message)
+	return path
 }

@@ -7,11 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/objones25/athena/internal/storage"
+	"github.com/objones25/athena/internal/storage/compression"
+	"github.com/rs/zerolog"
 )
 
 // Custom errors for better error handling
@@ -30,11 +33,15 @@ const (
 	defaultMinIdleConns         = 5
 )
 
+// RedisCache implements the Cache interface using Redis
 type RedisCache struct {
 	client               *redis.Client
 	defaultTTL           time.Duration
 	compressionThreshold int
 	config               Config
+	keyPrefix            string
+	logger               zerolog.Logger
+	compressor           *compression.Compressor
 }
 
 type Config struct {
@@ -131,6 +138,9 @@ func NewRedisCache(cfg Config) (*RedisCache, error) {
 		defaultTTL:           cfg.DefaultTTL,
 		compressionThreshold: cfg.CompressionThreshold,
 		config:               cfg,
+		keyPrefix:            "cache:",
+		logger:               zerolog.New(os.Stdout).With().Timestamp().Logger(),
+		compressor:           &compression.Compressor{Threshold: cfg.CompressionThreshold},
 	}, nil
 }
 
@@ -353,4 +363,95 @@ func isValidContentType(ct storage.ContentType) bool {
 	default:
 		return false
 	}
+}
+
+// WarmupConfig defines parameters for cache warming
+type WarmupConfig struct {
+	// Batch size for warming up items
+	BatchSize int
+	// Maximum number of items to warm up
+	MaxItems int
+	// Minimum access count for an item to be considered for warmup
+	MinAccessCount int
+}
+
+// WarmUp pre-populates the cache with frequently accessed items
+func (c *RedisCache) WarmUp(ctx context.Context, store storage.Store, cfg WarmupConfig) error {
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = 1000
+	}
+	if cfg.MaxItems <= 0 {
+		cfg.MaxItems = 10000
+	}
+	if cfg.MinAccessCount <= 0 {
+		cfg.MinAccessCount = 5
+	}
+
+	// Get frequently accessed items from store
+	items, err := store.GetFrequentItems(ctx, cfg.MaxItems, cfg.MinAccessCount)
+	if err != nil {
+		return fmt.Errorf("failed to get frequent items: %w", err)
+	}
+
+	// Process items in batches
+	for i := 0; i < len(items); i += cfg.BatchSize {
+		end := i + cfg.BatchSize
+		if end > len(items) {
+			end = len(items)
+		}
+		batch := items[i:end]
+
+		// Set items in cache
+		pipe := c.client.Pipeline()
+		for _, item := range batch {
+			data, err := c.marshal(item)
+			if err != nil {
+				c.logger.Error().Err(err).Str("item_id", item.ID).Msg("Failed to marshal item during warmup")
+				continue
+			}
+
+			pipe.Set(ctx, c.keyPrefix+item.ID, data, c.defaultTTL)
+		}
+
+		// Execute pipeline
+		if _, err := pipe.Exec(ctx); err != nil {
+			return fmt.Errorf("failed to execute pipeline during warmup: %w", err)
+		}
+
+		c.logger.Info().
+			Int("batch_size", len(batch)).
+			Int("total_processed", end).
+			Int("total_items", len(items)).
+			Msg("Cache warmup batch completed")
+	}
+
+	c.logger.Info().
+		Int("total_items", len(items)).
+		Msg("Cache warmup completed")
+	return nil
+}
+
+// marshal serializes an item for storage in Redis
+func (c *RedisCache) marshal(item *storage.Item) ([]byte, error) {
+	data, err := json.Marshal(item)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal item: %w", err)
+	}
+
+	// Compress if data exceeds threshold
+	if len(data) > c.compressor.Threshold {
+		compressed, err := c.compressor.Compress(data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compress item: %w", err)
+		}
+		return compressed, nil
+	}
+
+	return data, nil
+}
+
+// Store defines the interface for the backing store used in cache warming
+type Store interface {
+	// GetFrequentItems returns frequently accessed items for cache warming
+	GetFrequentItems(ctx context.Context, maxItems, minAccessCount int) ([]*storage.Item, error)
 }

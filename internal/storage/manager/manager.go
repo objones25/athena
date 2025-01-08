@@ -42,6 +42,7 @@ type Manager struct {
 	}
 	stopChan   chan struct{}
 	warmupChan chan struct{}
+	closed     bool
 }
 
 // NewManager creates a new storage manager with the provided configuration
@@ -350,8 +351,13 @@ func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.closed {
+		return nil
+	}
+
 	// Signal background tasks to stop
 	close(m.stopChan)
+	m.closed = true
 
 	var errs []error
 
