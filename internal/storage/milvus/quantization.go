@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/rs/zerolog/log"
 )
 
@@ -75,8 +75,8 @@ type Quantizer struct {
 	done         chan struct{}
 
 	// Add fields for Product Quantization
-	subQuantizers   []*Quantizer // Subquantizers for PQ
-	optimisticCache *lru.Cache   // Cache for optimistic search
+	subQuantizers   []*Quantizer                  // Subquantizers for PQ
+	optimisticCache *lru.Cache[string, []float32] // Cache for optimistic search
 }
 
 type quantizeResult struct {
@@ -87,10 +87,31 @@ type quantizeResult struct {
 
 // NewQuantizer creates a new vector quantizer
 func NewQuantizer(config QuantizationConfig, dimension int) *Quantizer {
-	cache, err := lru.New(1000) // Cache 1000 items
-	if err != nil {
-		log.Error().Err(err).Msg("failed to create optimistic cache")
+	// Validate and set defaults
+	if config.NumCentroids <= 0 {
+		config.NumCentroids = 256
 	}
+	if config.MaxIterations <= 0 {
+		config.MaxIterations = 100
+	}
+	if config.ConvergenceEps <= 0 {
+		config.ConvergenceEps = 0.001
+	}
+	if config.SampleSize <= 0 {
+		config.SampleSize = 10000
+	}
+	if config.BatchSize <= 0 {
+		config.BatchSize = 1000
+	}
+	if config.UpdateInterval <= 0 {
+		config.UpdateInterval = time.Hour // Default to 1 hour if not set
+	}
+	if config.NumWorkers <= 0 {
+		config.NumWorkers = runtime.NumCPU()
+	}
+
+	// Initialize cache for optimistic quantization
+	cache, _ := lru.New[string, []float32](1000) // Cache size of 1000 vectors
 
 	q := &Quantizer{
 		config:          config,
@@ -107,7 +128,7 @@ func NewQuantizer(config QuantizationConfig, dimension int) *Quantizer {
 		go q.worker()
 	}
 
-	// Start update monitor
+	// Start update monitor with validated interval
 	q.updateTicker = time.NewTicker(config.UpdateInterval)
 	go q.monitorUpdates()
 
@@ -403,56 +424,39 @@ func (q *Quantizer) quantizeProductVector(vector []float32) ([]int, []float32, e
 	return indices, distances, nil
 }
 
-// Add method for Optimistic Quantization
+// quantizeOptimistic uses optimistic quantization with caching
 func (q *Quantizer) quantizeOptimistic(vector []float32) (int, []float32, error) {
-	// Try cache first
-	if cached, ok := q.optimisticCache.Get(vectorKey(vector)); ok {
-		if result, ok := cached.(quantizeResult); ok {
-			return result.centroid, result.distances, nil
-		}
-	}
+	// Generate cache key
+	key := vectorKey(vector)
 
-	// Get initial estimate using subset of centroids
-	probeSize := q.config.OptimisticProbe
-	if probeSize > len(q.centroids) {
-		probeSize = len(q.centroids)
-	}
+	// Check cache
+	if cached, ok := q.optimisticCache.Get(key); ok {
+		// Use cached result
+		minDist := math.MaxFloat64
+		nearest := 0
+		distances := make([]float32, len(q.centroids))
 
-	minDist := float64(math.MaxFloat32)
-	bestCentroid := 0
-	distances := make([]float32, len(q.centroids))
-
-	// Check probe centroids first
-	for i := 0; i < probeSize; i++ {
-		dist := euclideanDistance(vector, q.centroids[i])
-		distances[i] = float32(dist)
-		if dist < minDist {
-			minDist = dist
-			bestCentroid = i
-		}
-	}
-
-	// Only check remaining centroids if the best distance is above threshold
-	if minDist > float64(q.config.ConvergenceEps) {
-		for i := probeSize; i < len(q.centroids); i++ {
-			dist := euclideanDistance(vector, q.centroids[i])
+		for i, centroid := range q.centroids {
+			dist := euclideanDistance(cached, centroid)
 			distances[i] = float32(dist)
 			if dist < minDist {
 				minDist = dist
-				bestCentroid = i
+				nearest = i
 			}
 		}
+		return nearest, distances, nil
 	}
 
-	result := quantizeResult{
-		centroid:  bestCentroid,
-		distances: distances,
+	// Not in cache, perform standard quantization
+	centroid, distances, err := q.standardQuantizeVector(context.Background(), vector)
+	if err != nil {
+		return 0, nil, err
 	}
 
 	// Cache the result
-	q.optimisticCache.Add(vectorKey(vector), result)
+	q.optimisticCache.Add(key, vector)
 
-	return bestCentroid, distances, nil
+	return centroid, distances, nil
 }
 
 // Add method for Residual Quantization
